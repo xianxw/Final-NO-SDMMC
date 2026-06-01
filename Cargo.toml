@@ -83,3 +83,19 @@ optional = true
 [package.metadata.vendor-filter]
 platforms = ["riscv64gc-unknown-none-elf", "loongarch64-unknown-none-softfloat"]
 all-features = true
+
+[patch.crates-io]
+axalloc = { package = "axallocator", path = "modules/axallocator" }
+axdma = { path = "modules/axdma-m" }
+axdriver = { path = "modules/axdriver-m" } # project related
+axdriver_block = { path = "modules/axdriver_block-m" } # project related
+axfs-ng = { path = "modules/axfs-ng" }
+axhal = { path = "modules/axhal" }
+axinput = { path = "modules/axinput" }
+axmm = { path = "modules/axmm" }
+axnet-ng = { path = "modules/axnet-ng" }
+axplat-riscv64-visionfive2 = { path = "modules/axplat-riscv64-visionfive2" }
+axruntime = { path = "modules/axruntime" }
+axsync = { path = "modules/axsync" }
+axtask ={ path = "modules/axtask" }
+simple-sdmmc = { path = "modules/simple-sdmmc-extended" } # project related
