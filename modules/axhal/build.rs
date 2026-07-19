@@ -1,6 +1,8 @@
 use std::{io::Result, path::Path};
 
 fn main() {
+    println!("cargo:rerun-if-changed=linker.lds.S");
+    println!("cargo:rerun-if-env-changed=DWARF");
     println!("cargo:rustc-check-cfg=cfg(plat_dyn)");
 
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap();

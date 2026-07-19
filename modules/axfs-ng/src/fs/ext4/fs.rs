@@ -14,6 +14,7 @@ use super::{
 };
 
 const EXT4_CONFIG: FsConfig = FsConfig { bcache_size: 256 };
+const EXT4_READ_ONLY: bool = false;
 
 pub struct Ext4Filesystem {
     inner: Mutex<LwExt4Filesystem>,
@@ -22,8 +23,14 @@ pub struct Ext4Filesystem {
 
 impl Ext4Filesystem {
     pub fn new(dev: AxBlockDevice) -> VfsResult<Filesystem> {
-        let ext4 =
-            lwext4_rust::Ext4Filesystem::new(Ext4Disk(dev), EXT4_CONFIG).map_err(into_vfs_err)?;
+        info!("Mounting ext4 root filesystem (read_only={EXT4_READ_ONLY})");
+        let disk = Ext4Disk::new(dev, EXT4_READ_ONLY);
+        let ext4 = if EXT4_READ_ONLY {
+            lwext4_rust::Ext4Filesystem::new_read_only(disk, EXT4_CONFIG)
+        } else {
+            lwext4_rust::Ext4Filesystem::new(disk, EXT4_CONFIG)
+        }
+        .map_err(into_vfs_err)?;
 
         let fs = Arc::new(Self {
             inner: Mutex::new(ext4),

@@ -92,6 +92,7 @@ axdriver_block = { path = "modules/axdriver_block-m" } # project related
 axfs-ng = { path = "modules/axfs-ng" }
 axhal = { path = "modules/axhal" }
 axinput = { path = "modules/axinput" }
+lwext4_rust = { path = "modules/lwext4_rust" }
 axmm = { path = "modules/axmm" }
 axnet-ng = { path = "modules/axnet-ng" }
 axplat-riscv64-visionfive2 = { path = "modules/axplat-riscv64-visionfive2" }

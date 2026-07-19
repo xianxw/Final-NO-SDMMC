@@ -1,7 +1,7 @@
 //! Interrupt management.
 
 use core::sync::atomic::{AtomicUsize, Ordering};
-use log::debug;
+use log::trace;
 
 #[cfg(feature = "ipi")]
 pub use axconfig::devices::IPI_IRQ;
@@ -36,10 +36,10 @@ pub fn register_irq_hook(hook: fn(usize)) -> bool {
 #[register_trap_handler(IRQ)]
 pub fn irq_handler(vector: usize) -> bool {
     let guard = kernel_guard::NoPreempt::new();
-    debug!("Global IRQ trap entered: vector={}", vector);
+    trace!("Global IRQ trap entered: vector={}", vector);
 
     if let Some(irq) = handle(vector) {
-        debug!("Global IRQ handler dispatched irq={}", irq);
+        trace!("Global IRQ handler dispatched irq={}", irq);
         let hook = IRQ_HOOK.load(Ordering::SeqCst);
         if hook != 0 {
             let hook = unsafe { core::mem::transmute::<usize, fn(usize)>(hook) };

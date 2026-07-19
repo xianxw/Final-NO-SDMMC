@@ -64,19 +64,19 @@ impl<'a> Command<'a> {
     pub(crate) fn build(self) -> (Cmd, u32, Option<DataXfer<'a>>) {
         let cmd = Cmd::default()
             .with_use_hold_reg(true)
-            .with_response_expect(true)
             .with_cmd_index(self.cmd_index());
-        let cmd_crc = cmd.with_check_response_crc(true);
+        let cmd_resp = cmd.with_response_expect(true);
+        let cmd_crc = cmd_resp.with_check_response_crc(true);
 
         match self {
-            Command::GoIdleState => (cmd_crc.with_send_initialization(true), 0, None),
+            Command::GoIdleState => (cmd.with_send_initialization(true), 0, None),
             Command::SendRelativeAddr => (cmd_crc, 0, None),
             Command::SelectCard(arg) => (cmd_crc, arg, None),
             Command::SendIfCond(arg) | Command::AppCmd(arg) => (cmd_crc, arg, None),
 
-            Command::AllSendCid => (cmd.with_response_length(true), 0, None),
-            Command::SendCsd(arg) => (cmd.with_response_length(true), arg, None),
-            Command::SdSendOpCond(arg) => (cmd, arg, None),
+            Command::AllSendCid => (cmd_crc.with_response_length(true), 0, None),
+            Command::SendCsd(arg) => (cmd_crc.with_response_length(true), arg, None),
+            Command::SdSendOpCond(arg) => (cmd_resp, arg, None),
 
             Command::ReadSingleBlock(block, buf) => (
                 cmd_crc.with_data_expected(true),
