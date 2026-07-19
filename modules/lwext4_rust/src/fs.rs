@@ -50,19 +50,11 @@ pub struct Ext4Filesystem<Hal: SystemHal, Dev: BlockDevice> {
 
 impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
     pub fn new(dev: Dev, config: FsConfig) -> Ext4Result<Self> {
-        Self::new_inner(dev, config, false)
-    }
-
-    pub fn new_read_only(dev: Dev, config: FsConfig) -> Ext4Result<Self> {
-        Self::new_inner(dev, config, true)
-    }
-
-    fn new_inner(dev: Dev, config: FsConfig, read_only: bool) -> Ext4Result<Self> {
         let mut bdev = Ext4BlockDevice::new(dev)?;
         let mut fs = Box::new(unsafe { mem::zeroed() });
         unsafe {
             let bd = bdev.inner.as_mut();
-            ext4_fs_init(&mut *fs, bd, read_only).context("ext4_fs_init")?;
+            ext4_fs_init(&mut *fs, bd, false).context("ext4_fs_init")?;
 
             let bs = get_block_size(&fs.sb);
             ext4_block_set_lb_size(bd, bs);
