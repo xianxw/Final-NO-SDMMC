@@ -113,6 +113,28 @@ impl WaitQueue {
         })
     }
 
+    /// Asynchronously waits until the condition becomes true or the duration elapses.
+    /// Returns `true` if the wait timed out.
+    pub async fn wait_timeout_until_async<F>(&self, dur: Duration, mut condition: F) -> bool
+    where
+        F: FnMut() -> bool,
+    {
+        let deadline = wall_time() + dur;
+        loop {
+            if condition() {
+                return false;
+            }
+            if wall_time() >= deadline {
+                return true;
+            }
+            listener!(self.event => listener);
+            if condition() {
+                return false;
+            }
+            let _ = timeout_at(Some(deadline), listener).await;
+        }
+    }
+
     /// Wakes up one task in the wait queue, usually the first one.
     /// This function should not be called in a loop, use `notify_many` instead.
     ///
