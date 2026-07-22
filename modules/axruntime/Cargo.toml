@@ -35,6 +35,7 @@ display = [
     "dep:axdisplay",
 ]
 dma = ["paging"]
+early-irq = ["irq"]
 fs = [
     "axdriver",
     "dep:axfs",

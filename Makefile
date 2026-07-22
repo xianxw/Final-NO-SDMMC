@@ -57,4 +57,7 @@ la:
 vf2:
 	$(MAKE) ARCH=riscv64 APP_FEATURES=vf2 MYPLAT=axplat-riscv64-visionfive2 BUS=mmio build
 
-.PHONY: build run justrun debug disasm clean
+vf2-async:
+	$(MAKE) ARCH=riscv64 APP_FEATURES=sdmmc-async MYPLAT=axplat-riscv64-visionfive2 BUS=mmio build
+
+.PHONY: build run justrun debug disasm clean vf2 vf2-async

@@ -3,6 +3,9 @@
 #![no_std]
 #![cfg_attr(doc, feature(doc_cfg))]
 
+#[cfg(feature = "sdmmc-async")]
+extern crate alloc;
+
 #[cfg(feature = "bcm2835-sdhci")]
 pub mod bcm2835sdhci;
 

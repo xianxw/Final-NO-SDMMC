@@ -216,6 +216,12 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
     #[cfg(feature = "multitask")]
     axtask::init_scheduler();
 
+    #[cfg(all(feature = "irq", feature = "early-irq"))]
+    {
+        info!("Initialize interrupt handlers before device probing...");
+        init_interrupt();
+    }
+
     #[cfg(feature = "axdriver")]
     {
         #[allow(unused_variables)]
@@ -251,7 +257,7 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
     #[cfg(feature = "smp")]
     self::mp::start_secondary_cpus(cpu_id);
 
-    #[cfg(feature = "irq")]
+    #[cfg(all(feature = "irq", not(feature = "early-irq")))]
     {
         info!("Initialize interrupt handlers...");
         init_interrupt();

@@ -10,7 +10,9 @@ pub enum Command<'a> {
     SendIfCond(u32),            // CMD8
     SendCsd(u32),               // CMD9
     ReadSingleBlock(u32, &'a mut [u8]),   // CMD17
+    ReadMultipleBlocks(u32, &'a mut [u8]), // CMD18
     WriteSingleBlock(u32, &'a [u8]),      // CMD24
+    WriteMultipleBlocks(u32, &'a [u8]),   // CMD25
     SdSendOpCond(u32),          // ACMD41
     SendScr(&'a mut [u8]),      // ACMD51
     AppCmd(u32),                // CMD55
@@ -28,7 +30,13 @@ impl fmt::Debug for Command<'_> {
             Command::SendIfCond(arg) => write!(f, "SendIfCond({arg})"),
             Command::SendCsd(rca) => write!(f, "SendCsd({rca})"),
             Command::ReadSingleBlock(block, _) => write!(f, "ReadSingleBlock({block})"),
+            Command::ReadMultipleBlocks(block, _) => {
+                write!(f, "ReadMultipleBlocks({block})")
+            }
             Command::WriteSingleBlock(block, _) => write!(f, "WriteSingleBlock({block})"),
+            Command::WriteMultipleBlocks(block, _) => {
+                write!(f, "WriteMultipleBlocks({block})")
+            }
             Command::SdSendOpCond(arg) => write!(f, "SdSendOpCond({arg})"),
             Command::SendScr(_) => write!(f, "SendScr"),
             Command::AppCmd(arg) => write!(f, "AppCmd({arg})"),
@@ -52,7 +60,9 @@ impl<'a> Command<'a> {
             Command::SendIfCond(_) => 8,
             Command::SendCsd(_) => 9,
             Command::ReadSingleBlock(..) => 17,
+            Command::ReadMultipleBlocks(..) => 18,
             Command::WriteSingleBlock(..) => 24,
+            Command::WriteMultipleBlocks(..) => 25,
             Command::SdSendOpCond(_) => 41,
             Command::SendScr(_) => 51,
             Command::AppCmd(_) => 55,
@@ -83,6 +93,11 @@ impl<'a> Command<'a> {
                 block,
                 Some(DataXfer::Read(buf)),
             ),
+            Command::ReadMultipleBlocks(block, buf) => (
+                cmd_crc.with_data_expected(true).with_send_auto_stop(true),
+                block,
+                Some(DataXfer::Read(buf)),
+            ),
             Command::SendScr(buf) => (
                 cmd_crc.with_data_expected(true),
                 0,
@@ -90,6 +105,14 @@ impl<'a> Command<'a> {
             ),
             Command::WriteSingleBlock(block, buf) => (
                 cmd_crc.with_data_expected(true).with_read_write(true),
+                block,
+                Some(DataXfer::Write(buf)),
+            ),
+            Command::WriteMultipleBlocks(block, buf) => (
+                cmd_crc
+                    .with_data_expected(true)
+                    .with_read_write(true)
+                    .with_send_auto_stop(true),
                 block,
                 Some(DataXfer::Write(buf)),
             ),

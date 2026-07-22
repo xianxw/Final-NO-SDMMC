@@ -47,6 +47,7 @@ bcm2835-sdhci = ["dep:bcm2835-sdhci"]
 ramdisk = []
 ramdisk-static = []
 sdmmc = ["dep:simple-sdmmc"]
+sdmmc-async = ["sdmmc", "dep:axhal", "dep:axtask"]
 
 [lib]
 name = "axdriver_block"
@@ -54,6 +55,15 @@ path = "src/lib.rs"
 
 [dependencies.axdriver_base]
 version = "0.1.4-preview.3"
+
+[dependencies.axtask]
+version = "=0.3.0-preview.2"
+features = ["multitask"]
+optional = true
+
+[dependencies.axhal]
+version = "=0.3.0-preview.2"
+optional = true
 
 [dependencies.bcm2835-sdhci]
 version = "0.1.1-preview.1"

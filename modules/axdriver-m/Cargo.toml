@@ -86,6 +86,7 @@ sdmmc = [
     "dep:axhal",
     "dep:axconfig",
 ]
+sdmmc-async = ["sdmmc", "axdriver_block/sdmmc-async"]
 virtio = [
     "dep:axdriver_virtio",
     "dep:axalloc",

@@ -406,6 +406,8 @@ name = "axdriver_block"
 version = "0.1.4-preview.3"
 dependencies = [
  "axdriver_base",
+ "axhal",
+ "axtask",
  "log",
  "simple-sdmmc",
 ]
@@ -3108,8 +3110,10 @@ dependencies = [
 name = "starryos"
 version = "0.2.0-preview.2"
 dependencies = [
+ "axdriver",
  "axfeat",
  "axplat-riscv64-visionfive2",
+ "axruntime",
  "starry-kernel",
 ]
 
