@@ -179,5 +179,3 @@ impl IdmacDescriptor {
         self.des3 = addr;
     }
 }
-
-// TODO: support descriptor ring to allow multi-block transfers without CPU intervention.

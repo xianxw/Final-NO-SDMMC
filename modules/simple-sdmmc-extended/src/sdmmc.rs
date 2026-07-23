@@ -21,6 +21,10 @@ use crate::{
 const VISIONFIVE2_SDIO_CIU_CLOCK_HZ: u32 = 49_500_000;
 const IDENTIFICATION_CLOCK_DIVIDER: u8 = 100;
 const DEFAULT_SPEED_CLOCK_DIVIDER: u8 = 1;
+const MAX_DMA_BLOCKS: usize = 32;
+const DMA_BUFFER_SIZE: usize = MAX_DMA_BLOCKS * 512;
+const IDMAC_DESCRIPTOR_BUFFER_SIZE: usize = 8 * 512;
+const MIN_MULTI_BLOCK_READ_BLOCKS: usize = 4;
 
 fn wait_until<F>(mut f: F)
 where
@@ -111,6 +115,7 @@ struct IdmacTransferContext {
     dma_desc_info: DMAInfo,
     layout: Layout,
     desc_ptr: *mut IdmacDescriptor,
+    descriptor_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -239,7 +244,7 @@ impl SdMmc {
             idmac_reset_failed: false,
         };
         this.init();
-        this.try_enable_idmac(512, AHBDataWidth::Bits32, register_irq);
+        this.try_enable_idmac(DMA_BUFFER_SIZE, AHBDataWidth::Bits32, register_irq);
 
         this
     }
@@ -336,7 +341,9 @@ impl SdMmc {
                     .with_ri(true)
                     .with_ti(true),
             );
-            self.regs.intmask().update(|r| r.with_dto(true));
+            self.regs
+                .intmask()
+                .update(|r| r.with_acd(true).with_dto(true));
             dma_io_fence();
         }
 
@@ -791,86 +798,239 @@ impl SdMmc {
         info!("SD/MMC driver initialized");
     }
 
+    fn validate_block_buffer(&self, block: u32, len: usize) -> usize {
+        assert!(len != 0, "SD/MMC transfer buffer must not be empty");
+        assert_eq!(
+            len % Self::BLOCK_SIZE,
+            0,
+            "SD/MMC transfer length must be block aligned"
+        );
+        let blocks = len / Self::BLOCK_SIZE;
+        let end = (block as u64)
+            .checked_add(blocks as u64)
+            .expect("SD/MMC transfer range overflow");
+        assert!(
+            end <= self.num_blocks,
+            "SD/MMC transfer range exceeds card capacity"
+        );
+        blocks
+    }
+
+    fn read_dma_chunk(&mut self, block: u32, buf: &mut [u8]) {
+        debug_assert!(buf.len() <= DMA_BUFFER_SIZE);
+        debug_assert!(buf.len().is_multiple_of(Self::BLOCK_SIZE));
+        debug_assert!(
+            buf.len() == Self::BLOCK_SIZE
+                || buf.len() >= MIN_MULTI_BLOCK_READ_BLOCKS * Self::BLOCK_SIZE
+        );
+        self.set_transaction_size(Self::BLOCK_SIZE as u16, buf.len() as u32);
+
+        let dma_buf_info = self
+            .dma_buffer
+            .as_ref()
+            .expect("synchronous DMA read requested without an IDMAC buffer");
+        let dma_buf_virt_ptr = dma_buf_info.addr.cpu_addr.as_ptr();
+        let dma_bus_addr = u32::try_from(dma_buf_info.addr.bus_addr.as_u64())
+            .expect("DMA buffer address exceeds the IDMAC 32-bit address range");
+        let dma_buf = unsafe { core::slice::from_raw_parts_mut(dma_buf_virt_ptr, buf.len()) };
+        let command = if buf.len() == Self::BLOCK_SIZE {
+            Command::ReadSingleBlock(block, dma_buf)
+        } else {
+            Command::ReadMultipleBlocks(block, dma_buf)
+        };
+        self.send_cmd_idmac(command, dma_bus_addr)
+            .expect("synchronous IDMAC read failed");
+
+        let dma_usr_slice = unsafe { core::slice::from_raw_parts(dma_buf_virt_ptr, buf.len()) };
+        buf.copy_from_slice(dma_usr_slice);
+    }
+
+    async fn read_dma_chunk_async(&mut self, block: u32, buf: &mut [u8]) {
+        debug_assert!(buf.len() <= DMA_BUFFER_SIZE);
+        debug_assert!(buf.len().is_multiple_of(Self::BLOCK_SIZE));
+        debug_assert!(
+            buf.len() == Self::BLOCK_SIZE
+                || buf.len() >= MIN_MULTI_BLOCK_READ_BLOCKS * Self::BLOCK_SIZE
+        );
+        self.set_transaction_size(Self::BLOCK_SIZE as u16, buf.len() as u32);
+
+        let dma_buf_info = self
+            .dma_buffer
+            .as_ref()
+            .expect("asynchronous DMA read requested without an IDMAC buffer");
+        let dma_buf_virt_ptr = dma_buf_info.addr.cpu_addr.as_ptr();
+        let dma_bus_addr = u32::try_from(dma_buf_info.addr.bus_addr.as_u64())
+            .expect("DMA buffer address exceeds the IDMAC 32-bit address range");
+        let dma_buf = unsafe { core::slice::from_raw_parts_mut(dma_buf_virt_ptr, buf.len()) };
+        let command = if buf.len() == Self::BLOCK_SIZE {
+            Command::ReadSingleBlock(block, dma_buf)
+        } else {
+            Command::ReadMultipleBlocks(block, dma_buf)
+        };
+        self.send_cmd_idmac_async(command, dma_bus_addr)
+            .await
+            .expect("asynchronous IDMAC read failed");
+
+        let dma_usr_slice = unsafe { core::slice::from_raw_parts(dma_buf_virt_ptr, buf.len()) };
+        buf.copy_from_slice(dma_usr_slice);
+    }
+
+    fn wait_card_ready_after_write(&mut self) {
+        let deadline = axhal::time::monotonic_time() + Duration::from_secs(5);
+        while !self.can_send_data() {
+            if axhal::time::monotonic_time() >= deadline {
+                self.idmac_faulted = true;
+                panic!("SD/MMC card stayed busy after write");
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    fn write_dma_chunk(&mut self, block: u32, buf: &[u8]) {
+        debug_assert!(buf.len() <= DMA_BUFFER_SIZE);
+        debug_assert!(buf.len().is_multiple_of(Self::BLOCK_SIZE));
+        self.set_transaction_size(Self::BLOCK_SIZE as u16, buf.len() as u32);
+
+        let dma_buf_info = self
+            .dma_buffer
+            .as_ref()
+            .expect("synchronous DMA write requested without an IDMAC buffer");
+        let dma_buf_virt_ptr = dma_buf_info.addr.cpu_addr.as_ptr();
+        let dma_bus_addr = u32::try_from(dma_buf_info.addr.bus_addr.as_u64())
+            .expect("DMA buffer address exceeds the IDMAC 32-bit address range");
+        let dma_usr_slice = unsafe { core::slice::from_raw_parts_mut(dma_buf_virt_ptr, buf.len()) };
+        dma_usr_slice.copy_from_slice(buf);
+
+        let dma_buf = unsafe { core::slice::from_raw_parts(dma_buf_virt_ptr, buf.len()) };
+        let command = if buf.len() == Self::BLOCK_SIZE {
+            Command::WriteSingleBlock(block, dma_buf)
+        } else {
+            Command::WriteMultipleBlocks(block, dma_buf)
+        };
+        self.send_cmd_idmac(command, dma_bus_addr)
+            .expect("synchronous IDMAC write failed");
+        self.wait_card_ready_after_write();
+    }
+
+    async fn write_dma_chunk_async(&mut self, block: u32, buf: &[u8]) {
+        debug_assert!(buf.len() <= DMA_BUFFER_SIZE);
+        debug_assert!(buf.len().is_multiple_of(Self::BLOCK_SIZE));
+        self.set_transaction_size(Self::BLOCK_SIZE as u16, buf.len() as u32);
+
+        let dma_buf_info = self
+            .dma_buffer
+            .as_ref()
+            .expect("asynchronous DMA write requested without an IDMAC buffer");
+        let dma_buf_virt_ptr = dma_buf_info.addr.cpu_addr.as_ptr();
+        let dma_usr_slice = unsafe { core::slice::from_raw_parts_mut(dma_buf_virt_ptr, buf.len()) };
+        dma_usr_slice.copy_from_slice(buf);
+
+        let dma_bus_addr = u32::try_from(dma_buf_info.addr.bus_addr.as_u64())
+            .expect("DMA buffer address exceeds the IDMAC 32-bit address range");
+        let dma_buf = unsafe { core::slice::from_raw_parts(dma_buf_virt_ptr, buf.len()) };
+        let command = if buf.len() == Self::BLOCK_SIZE {
+            Command::WriteSingleBlock(block, dma_buf)
+        } else {
+            Command::WriteMultipleBlocks(block, dma_buf)
+        };
+        self.send_cmd_idmac_async(command, dma_bus_addr)
+            .await
+            .expect("asynchronous IDMAC write failed");
+        self.wait_card_ready_after_write();
+    }
+
+    /// Reads one or more contiguous blocks from the SD/MMC card.
+    pub fn read_blocks(&mut self, mut block: u32, mut buf: &mut [u8]) {
+        self.validate_block_buffer(block, buf.len());
+        while !buf.is_empty() {
+            let remaining_blocks = buf.len() / Self::BLOCK_SIZE;
+            let chunk_blocks = if remaining_blocks >= MIN_MULTI_BLOCK_READ_BLOCKS {
+                remaining_blocks.min(MAX_DMA_BLOCKS)
+            } else {
+                1
+            };
+            let (chunk, remaining) = buf.split_at_mut(chunk_blocks * Self::BLOCK_SIZE);
+            self.read_dma_chunk(block, chunk);
+            buf = remaining;
+            if !buf.is_empty() {
+                block = block
+                    .checked_add(chunk_blocks as u32)
+                    .expect("SD/MMC read block address overflow");
+            }
+        }
+    }
+
+    /// Reads one or more contiguous blocks and asynchronously waits for each DMA chunk.
+    pub async fn read_blocks_async(&mut self, mut block: u32, mut buf: &mut [u8]) {
+        self.validate_block_buffer(block, buf.len());
+        while !buf.is_empty() {
+            let remaining_blocks = buf.len() / Self::BLOCK_SIZE;
+            let chunk_blocks = if remaining_blocks >= MIN_MULTI_BLOCK_READ_BLOCKS {
+                remaining_blocks.min(MAX_DMA_BLOCKS)
+            } else {
+                1
+            };
+            let (chunk, remaining) = buf.split_at_mut(chunk_blocks * Self::BLOCK_SIZE);
+            self.read_dma_chunk_async(block, chunk).await;
+            buf = remaining;
+            if !buf.is_empty() {
+                block = block
+                    .checked_add(chunk_blocks as u32)
+                    .expect("SD/MMC asynchronous read block address overflow");
+            }
+        }
+    }
+
+    /// Writes one or more contiguous blocks to the SD/MMC card.
+    pub fn write_blocks(&mut self, mut block: u32, mut buf: &[u8]) {
+        self.validate_block_buffer(block, buf.len());
+        while !buf.is_empty() {
+            let chunk_blocks = (buf.len() / Self::BLOCK_SIZE).min(MAX_DMA_BLOCKS);
+            let (chunk, remaining) = buf.split_at(chunk_blocks * Self::BLOCK_SIZE);
+            self.write_dma_chunk(block, chunk);
+            buf = remaining;
+            if !buf.is_empty() {
+                block = block
+                    .checked_add(chunk_blocks as u32)
+                    .expect("SD/MMC write block address overflow");
+            }
+        }
+    }
+
+    /// Writes one or more contiguous blocks and asynchronously waits for each DMA chunk.
+    pub async fn write_blocks_async(&mut self, mut block: u32, mut buf: &[u8]) {
+        self.validate_block_buffer(block, buf.len());
+        while !buf.is_empty() {
+            let chunk_blocks = (buf.len() / Self::BLOCK_SIZE).min(MAX_DMA_BLOCKS);
+            let (chunk, remaining) = buf.split_at(chunk_blocks * Self::BLOCK_SIZE);
+            self.write_dma_chunk_async(block, chunk).await;
+            buf = remaining;
+            if !buf.is_empty() {
+                block = block
+                    .checked_add(chunk_blocks as u32)
+                    .expect("SD/MMC asynchronous write block address overflow");
+            }
+        }
+    }
+
     /// Reads a single block from the SD/MMC card.
     pub fn read_block(&mut self, block: u32, buf: &mut [u8; 512]) {
-        self.set_transaction_size(512, 512);
-
-        if let Some(dma_buf_info) = &self.dma_buffer {
-            let dma_buf_virt_ptr = dma_buf_info.addr.cpu_addr.as_ptr();
-            let dma_buf = unsafe { core::slice::from_raw_parts_mut(dma_buf_virt_ptr, buf.len()) };
-            let dma_bus_addr = u32::try_from(dma_buf_info.addr.bus_addr.as_u64())
-                .expect("DMA buffer address exceeds the IDMAC 32-bit address range");
-
-            self.send_cmd_idmac(Command::ReadSingleBlock(block, dma_buf), dma_bus_addr)
-                .unwrap();
-
-            let dma_usr_slice = unsafe { core::slice::from_raw_parts(dma_buf_virt_ptr, buf.len()) };
-            buf.copy_from_slice(dma_usr_slice);
-        } else {
-            panic!("synchronous DMA read requested without an IDMAC buffer");
-        }
+        self.read_blocks(block, buf);
     }
 
     /// Reads a single block using IDMAC and asynchronously waits for completion.
     pub async fn read_block_async(&mut self, block: u32, buf: &mut [u8; 512]) {
-        self.set_transaction_size(512, 512);
-
-        if let Some(dma_buf_info) = &self.dma_buffer {
-            let dma_buf_virt_ptr = dma_buf_info.addr.cpu_addr.as_ptr();
-            let dma_buf = unsafe { core::slice::from_raw_parts_mut(dma_buf_virt_ptr, buf.len()) };
-            let dma_bus_addr = u32::try_from(dma_buf_info.addr.bus_addr.as_u64())
-                .expect("DMA buffer address exceeds the IDMAC 32-bit address range");
-
-            self.send_cmd_idmac_async(Command::ReadSingleBlock(block, dma_buf), dma_bus_addr)
-                .await
-                .expect("asynchronous IDMAC read failed; benchmark must stop");
-
-            let dma_usr_slice = unsafe { core::slice::from_raw_parts(dma_buf_virt_ptr, buf.len()) };
-            buf.copy_from_slice(dma_usr_slice);
-        } else {
-            panic!("asynchronous DMA read requested without an IDMAC buffer");
-        }
+        self.read_blocks_async(block, buf).await;
     }
 
     /// Writes a single block to the SD/MMC card.
     pub fn write_block(&mut self, block: u32, buf: &[u8; 512]) {
-        self.set_transaction_size(512, 512);
-
-        if let Some(dma_buf_info) = &self.dma_buffer {
-            let dma_buf_virt_ptr = dma_buf_info.addr.cpu_addr.as_ptr();
-            let dma_usr_slice =
-                unsafe { core::slice::from_raw_parts_mut(dma_buf_virt_ptr, buf.len()) };
-            dma_usr_slice.copy_from_slice(buf);
-
-            let dma_buf = unsafe { core::slice::from_raw_parts(dma_buf_virt_ptr, buf.len()) };
-            let dma_bus_addr = u32::try_from(dma_buf_info.addr.bus_addr.as_u64())
-                .expect("DMA buffer address exceeds the IDMAC 32-bit address range");
-            self.send_cmd_idmac(Command::WriteSingleBlock(block, dma_buf), dma_bus_addr)
-                .unwrap();
-        } else {
-            panic!("synchronous DMA write requested without an IDMAC buffer");
-        }
+        self.write_blocks(block, buf);
     }
 
     /// Writes a single block using IDMAC and asynchronously waits for completion.
     pub async fn write_block_async(&mut self, block: u32, buf: &[u8; 512]) {
-        self.set_transaction_size(512, 512);
-
-        if let Some(dma_buf_info) = &self.dma_buffer {
-            let dma_buf_virt_ptr = dma_buf_info.addr.cpu_addr.as_ptr();
-            let dma_usr_slice =
-                unsafe { core::slice::from_raw_parts_mut(dma_buf_virt_ptr, buf.len()) };
-            dma_usr_slice.copy_from_slice(buf);
-
-            let dma_buf = unsafe { core::slice::from_raw_parts(dma_buf_virt_ptr, buf.len()) };
-            let dma_bus_addr = u32::try_from(dma_buf_info.addr.bus_addr.as_u64())
-                .expect("DMA buffer address exceeds the IDMAC 32-bit address range");
-            self.send_cmd_idmac_async(Command::WriteSingleBlock(block, dma_buf), dma_bus_addr)
-                .await
-                .expect("asynchronous IDMAC write failed; benchmark must stop");
-        } else {
-            panic!("asynchronous DMA write requested without an IDMAC buffer");
-        }
+        self.write_blocks_async(block, buf).await;
     }
 
     /// Returns the number of blocks.
@@ -932,6 +1092,7 @@ impl SdMmc {
         let rintsts_before_enable = self.regs.rintsts().read();
         let idsts_before_enable = self.regs.idsts().read();
         if rintsts_before_enable.error()
+            || rintsts_before_enable.auto_command_done()
             || rintsts_before_enable.data_transfer_over()
             || rintsts_before_enable.receive_fifo_data_request()
             || rintsts_before_enable.transmit_fifo_data_request()
@@ -1010,7 +1171,7 @@ impl SdMmc {
             return;
         }
 
-        // Enable IDMAC completion/error interrupts and controller DTO.
+        // Enable IDMAC completion/error interrupts and controller ACD/DTO.
         self.regs.idinten().write(
             crate::regs::IdIntEn::new()
                 .with_ai(true)
@@ -1023,7 +1184,7 @@ impl SdMmc {
         );
         self.regs
             .intmask()
-            .write(crate::regs::IntMask::new().with_dto(true));
+            .write(crate::regs::IntMask::new().with_acd(true).with_dto(true));
 
         let idinten_after = self.regs.idinten().read();
         let intmask_after = self.regs.intmask().read();
@@ -1041,13 +1202,16 @@ impl SdMmc {
                  register access"
             );
         }
-        if !intmask_after.dto()
+        if !intmask_after.acd()
+            || !intmask_after.dto()
             || intmask_after.cmd()
             || intmask_after.rxdr()
             || intmask_after.txdr()
         {
             warn!(
-                "try_enable_idmac: INTMASK mismatch after write; dto={}, cmd={}, rxdr={}, txdr={}",
+                "try_enable_idmac: INTMASK mismatch after write; acd={}, dto={}, cmd={}, rxdr={}, \
+                 txdr={}",
+                intmask_after.acd(),
                 intmask_after.dto(),
                 intmask_after.cmd(),
                 intmask_after.rxdr(),
@@ -1165,39 +1329,91 @@ impl SdMmc {
             DataXfer::Write(buf) => buf.len(),
         };
 
+        assert!(buf_len != 0, "IDMAC transfer buffer must not be empty");
         assert!(
-            buf_len <= 0x1fff,
-            "IDMAC single descriptor buffer too large: {buf_len}"
+            buf_len <= DMA_BUFFER_SIZE,
+            "IDMAC transfer exceeds the DMA bounce buffer: {buf_len}"
         );
 
-        // One descriptor covers the contiguous single-block buffer.
-        let layout = Layout::new::<IdmacDescriptor>();
+        let descriptor_count = buf_len.div_ceil(IDMAC_DESCRIPTOR_BUFFER_SIZE);
+        let layout = Layout::array::<IdmacDescriptor>(descriptor_count)
+            .expect("Invalid IDMAC descriptor chain layout");
         let dma_desc_info =
             unsafe { alloc_coherent(layout) }.expect("Failed to allocate DMA descriptor");
         let desc_ptr = dma_desc_info.cpu_addr.as_ptr() as *mut IdmacDescriptor;
-
-        let mut descriptor = IdmacDescriptor::new();
-        descriptor.set_desc0_control_descriptor(true, false, false, false, true, true, false);
-        descriptor.set_des1_buffer1_size(buf_len as u16);
-        descriptor.set_des2_buffer1_address(dma_bus_addr);
-        descriptor.set_des3_next_descriptor_address(0);
-        unsafe { core::ptr::write_volatile(desc_ptr, descriptor) };
-
         let desc_phy_addr = u32::try_from(dma_desc_info.bus_addr.as_u64())
             .expect("DMA descriptor address exceeds the IDMAC 32-bit address range");
+
+        for index in 0..descriptor_count {
+            let offset = index * IDMAC_DESCRIPTOR_BUFFER_SIZE;
+            let segment_len = (buf_len - offset).min(IDMAC_DESCRIPTOR_BUFFER_SIZE);
+            let last = index + 1 == descriptor_count;
+            let buffer_addr = dma_bus_addr
+                .checked_add(offset as u32)
+                .expect("DMA data buffer crosses the IDMAC 32-bit address boundary");
+            let next_descriptor_addr = if last {
+                0
+            } else {
+                desc_phy_addr
+                    .checked_add(((index + 1) * core::mem::size_of::<IdmacDescriptor>()) as u32)
+                    .expect("DMA descriptor chain crosses the IDMAC 32-bit address boundary")
+            };
+
+            let mut descriptor = IdmacDescriptor::new();
+            descriptor.set_desc0_control_descriptor(
+                true,
+                false,
+                false,
+                !last,
+                index == 0,
+                last,
+                !last,
+            );
+            descriptor.set_des1_buffer1_size(segment_len as u16);
+            descriptor.set_des2_buffer1_address(buffer_addr);
+            descriptor.set_des3_next_descriptor_address(next_descriptor_addr);
+            unsafe { core::ptr::write_volatile(desc_ptr.add(index), descriptor) };
+        }
+
         dma_io_fence();
         self.regs.bytcnt().write(buf_len as u32);
         self.regs.dbaddr().write(desc_phy_addr);
         dma_io_fence();
 
-        Some(IdmacTransferContext {
+        let context = IdmacTransferContext {
             cmd,
             arg,
             generation: 0,
             dma_desc_info,
             layout,
             desc_ptr,
-        })
+            descriptor_count,
+        };
+        let programmed_dbaddr = self.regs.dbaddr().read();
+        let programmed_byte_count = self.regs.bytcnt().read();
+        let owned_descriptors = Self::descriptor_owned_count(&context);
+        if programmed_dbaddr != desc_phy_addr
+            || programmed_byte_count != buf_len as u32
+            || owned_descriptors != descriptor_count
+        {
+            warn!(
+                "IDMAC descriptor publication failed before cmd={}: expected_DBADDR=0x{:08x}, \
+                 actual_DBADDR=0x{:08x}, expected_BYTCNT={}, actual_BYTCNT={}, expected_OWN={}, \
+                 actual_OWN={}",
+                cmd.cmd_index(),
+                desc_phy_addr,
+                programmed_dbaddr,
+                buf_len,
+                programmed_byte_count,
+                descriptor_count,
+                owned_descriptors,
+            );
+            self.idmac_faulted = true;
+            let _ = self.finish_idmac_transfer(context, true);
+            return None;
+        }
+
+        Some(context)
     }
 
     fn start_idmac_transfer(
@@ -1323,25 +1539,43 @@ impl SdMmc {
         }
 
         let command_done = !context.cmd.response_expect() || rintsts.command_done();
+        let auto_stop_done = !context.cmd.send_auto_stop() || rintsts.auto_command_done();
         let dma_done = if context.cmd.read_write() {
             idsts.ti()
         } else {
             idsts.ri()
         };
-        command_done && dma_done && rintsts.data_transfer_over()
+        command_done && auto_stop_done && dma_done && rintsts.data_transfer_over()
+    }
+
+    fn descriptor_owned_count(context: &IdmacTransferContext) -> usize {
+        (0..context.descriptor_count)
+            .filter(|&index| {
+                let descriptor = unsafe { context.desc_ptr.add(index) };
+                let des0 =
+                    unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*descriptor).des0)) };
+                des0.own()
+            })
+            .count()
     }
 
     fn descriptor_owned(context: &IdmacTransferContext) -> bool {
-        let des0 = unsafe {
-            core::ptr::read_volatile(core::ptr::addr_of!((*context.desc_ptr).des0))
-        };
-        des0.own()
+        Self::descriptor_owned_count(context) != 0
+    }
+
+    fn descriptor_card_error(context: &IdmacTransferContext) -> bool {
+        (0..context.descriptor_count).any(|index| {
+            let descriptor = unsafe { context.desc_ptr.add(index) };
+            let des0 = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*descriptor).des0)) };
+            des0.ces()
+        })
     }
 
     fn validate_idmac_terminal(&self, context: &IdmacTransferContext) -> bool {
         let (rintsts, idsts) = self.idmac_completion_status(context.generation);
         let has_error = Self::idmac_status_has_error(&rintsts, &idsts);
         let command_done = !context.cmd.response_expect() || rintsts.command_done();
+        let auto_stop_done = !context.cmd.send_auto_stop() || rintsts.auto_command_done();
         let dma_done = if context.cmd.read_write() {
             idsts.ti()
         } else {
@@ -1351,18 +1585,23 @@ impl SdMmc {
 
         dma_io_fence();
         let descriptor_owned = Self::descriptor_owned(context);
+        let descriptor_card_error = Self::descriptor_card_error(context);
         let complete = !has_error
             && command_done
+            && auto_stop_done
             && dma_done
             && controller_done
-            && !descriptor_owned;
+            && !descriptor_owned
+            && !descriptor_card_error;
 
         if !complete {
             warn!(
-                "IDMAC terminal validation failed: cmd={}, RINTSTS={rintsts:?}, \
-                 IDSTS={idsts:?}, command_done={command_done}, dma_done={dma_done}, \
-                 controller_done={controller_done}, desc_own={descriptor_owned}",
+                "IDMAC terminal validation failed: cmd={}, RINTSTS={rintsts:?}, IDSTS={idsts:?}, \
+                 command_done={command_done}, auto_stop_done={auto_stop_done}, \
+                 dma_done={dma_done}, controller_done={controller_done}, \
+                 desc_own={descriptor_owned}, desc_ces={descriptor_card_error}, descriptors={}",
                 context.cmd.cmd_index(),
+                context.descriptor_count,
             );
         }
 
@@ -1543,6 +1782,7 @@ impl SdMmc {
             let idmac_error =
                 idsts.ais() || idsts.ces() || idsts.du() || idsts.fbe() || rintsts.error();
             let transfer_done = idsts.ri() || idsts.ti() || rintsts.data_transfer_over();
+            let transfer_event = transfer_done || rintsts.auto_command_done();
 
             if idmac_error {
                 IDMAC_ERROR_FLAG.store(true, Ordering::Release);
@@ -1553,7 +1793,7 @@ impl SdMmc {
                 regs.idsts().write(idsts);
             }
 
-            if transfer_done
+            if transfer_event
                 || idmac_error
                 || rintsts.receive_fifo_data_request()
                 || rintsts.transmit_fifo_data_request()
@@ -1561,6 +1801,7 @@ impl SdMmc {
                 let mut clear_rintsts = crate::regs::RIntSts::new();
                 clear_rintsts = clear_rintsts
                     .with_end_bit_error(rintsts.end_bit_error())
+                    .with_auto_command_done(rintsts.auto_command_done())
                     .with_start_bit_error(rintsts.start_bit_error())
                     .with_hardware_locked_write(rintsts.hardware_locked_write())
                     .with_fifo_under_over_run(rintsts.fifo_under_over_run())
@@ -1577,7 +1818,7 @@ impl SdMmc {
             }
 
             IDMAC_COMPLETION.record_irq(rintsts, idsts);
-            should_notify = transfer_done || idmac_error;
+            should_notify = transfer_event || idmac_error;
 
             if !has_rintsts && !has_idsts {
                 debug!(

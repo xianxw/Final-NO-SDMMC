@@ -52,30 +52,34 @@ impl BlockDriverOps for SdMmcDriver {
     }
 
     fn read_block(&mut self, block_id: u64, buf: &mut [u8]) -> DevResult {
-        let (blocks, remainder) = buf.as_chunks_mut::<{ SdMmc::BLOCK_SIZE }>();
-
-        if !remainder.is_empty() {
+        if buf.is_empty() || !buf.len().is_multiple_of(SdMmc::BLOCK_SIZE) {
+            return Err(DevError::InvalidParam);
+        }
+        let block_count = (buf.len() / SdMmc::BLOCK_SIZE) as u64;
+        let Some(end_block) = block_id.checked_add(block_count) else {
+            return Err(DevError::InvalidParam);
+        };
+        if block_id > u32::MAX as u64 || end_block > self.0.num_blocks() {
             return Err(DevError::InvalidParam);
         }
 
-        for (i, block) in blocks.iter_mut().enumerate() {
-            self.0.read_block(block_id as u32 + i as u32, block);
-        }
-
+        self.0.read_blocks(block_id as u32, buf);
         Ok(())
     }
 
     fn write_block(&mut self, block_id: u64, buf: &[u8]) -> DevResult {
-        let (blocks, remainder) = buf.as_chunks::<{ SdMmc::BLOCK_SIZE }>();
-
-        if !remainder.is_empty() {
+        if buf.is_empty() || !buf.len().is_multiple_of(SdMmc::BLOCK_SIZE) {
+            return Err(DevError::InvalidParam);
+        }
+        let block_count = (buf.len() / SdMmc::BLOCK_SIZE) as u64;
+        let Some(end_block) = block_id.checked_add(block_count) else {
+            return Err(DevError::InvalidParam);
+        };
+        if block_id > u32::MAX as u64 || end_block > self.0.num_blocks() {
             return Err(DevError::InvalidParam);
         }
 
-        for (i, block) in blocks.iter().enumerate() {
-            self.0.write_block(block_id as u32 + i as u32, block);
-        }
-
+        self.0.write_blocks(block_id as u32, buf);
         Ok(())
     }
 
