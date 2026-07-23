@@ -3108,6 +3108,7 @@ dependencies = [
 name = "starryos"
 version = "0.2.0-preview.2"
 dependencies = [
+ "axdriver",
  "axfeat",
  "axplat-riscv64-visionfive2",
  "starry-kernel",

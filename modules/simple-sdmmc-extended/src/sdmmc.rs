@@ -1,3 +1,5 @@
+#[cfg(feature = "multi-block-test")]
+use alloc::{vec, vec::Vec};
 use core::{
     alloc::Layout,
     ptr::NonNull,
@@ -21,6 +23,237 @@ use crate::{
 const VISIONFIVE2_SDIO_CIU_CLOCK_HZ: u32 = 49_500_000;
 const IDENTIFICATION_CLOCK_DIVIDER: u8 = 100;
 const DEFAULT_SPEED_CLOCK_DIVIDER: u8 = 1;
+const DMA_BUFFER_SIZE: usize = 32 * 512;
+const IDMAC_DESCRIPTOR_BUFFER_SIZE: usize = 8 * 512;
+
+#[cfg(feature = "multi-block-test")]
+const MULTI_BLOCK_TEST_START_LBA: u32 = 2_099_200;
+#[cfg(feature = "multi-block-test")]
+const MULTI_BLOCK_TEST_BLOCKS: usize = 256;
+#[cfg(feature = "multi-block-test")]
+const MULTI_BLOCK_TEST_ROUNDS: usize = 5;
+#[cfg(feature = "multi-block-test")]
+const MULTI_BLOCK_REQUEST_SIZES: [usize; 6] = [1, 2, 4, 8, 16, 32];
+
+#[cfg(feature = "multi-block-test")]
+#[derive(Clone, Copy)]
+enum MultiBlockOperation {
+    Read,
+    Write,
+}
+
+#[cfg(feature = "multi-block-test")]
+impl MultiBlockOperation {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+        }
+    }
+}
+
+#[cfg(feature = "multi-block-test")]
+#[derive(Clone, Copy)]
+#[repr(usize)]
+enum MultiBlockPhase {
+    Total,
+    TransactionConfig,
+    BounceCopy,
+    IdleWait,
+    StatusClear,
+    DescriptorAlloc,
+    DescriptorPublish,
+    CommandIssue,
+    CommandAccept,
+    PostStartChecks,
+    CommandResponse,
+    DataTransfer,
+    AutoStopTail,
+    TerminalValidate,
+    FinishCleanup,
+    CardBusy,
+    Unaccounted,
+}
+
+#[cfg(feature = "multi-block-test")]
+impl MultiBlockPhase {
+    const COUNT: usize = 17;
+    const ALL: [Self; Self::COUNT] = [
+        Self::Total,
+        Self::TransactionConfig,
+        Self::BounceCopy,
+        Self::IdleWait,
+        Self::StatusClear,
+        Self::DescriptorAlloc,
+        Self::DescriptorPublish,
+        Self::CommandIssue,
+        Self::CommandAccept,
+        Self::PostStartChecks,
+        Self::CommandResponse,
+        Self::DataTransfer,
+        Self::AutoStopTail,
+        Self::TerminalValidate,
+        Self::FinishCleanup,
+        Self::CardBusy,
+        Self::Unaccounted,
+    ];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Total => "total",
+            Self::TransactionConfig => "transaction_config",
+            Self::BounceCopy => "bounce_copy",
+            Self::IdleWait => "previous_idle_wait",
+            Self::StatusClear => "status_clear",
+            Self::DescriptorAlloc => "descriptor_alloc",
+            Self::DescriptorPublish => "descriptor_publish",
+            Self::CommandIssue => "command_issue",
+            Self::CommandAccept => "command_accept",
+            Self::PostStartChecks => "post_start_checks",
+            Self::CommandResponse => "command_response",
+            Self::DataTransfer => "data_transfer",
+            Self::AutoStopTail => "auto_stop_tail",
+            Self::TerminalValidate => "terminal_validate",
+            Self::FinishCleanup => "finish_cleanup",
+            Self::CardBusy => "card_busy",
+            Self::Unaccounted => "unaccounted",
+        }
+    }
+}
+
+#[cfg(feature = "multi-block-test")]
+#[derive(Clone, Copy)]
+struct MultiBlockPhaseStats {
+    count: u64,
+    total_ns: u64,
+    min_ns: u64,
+    max_ns: u64,
+}
+
+#[cfg(feature = "multi-block-test")]
+impl MultiBlockPhaseStats {
+    const fn new() -> Self {
+        Self {
+            count: 0,
+            total_ns: 0,
+            min_ns: u64::MAX,
+            max_ns: 0,
+        }
+    }
+
+    fn record(&mut self, duration_ns: u64) {
+        self.count = self.count.saturating_add(1);
+        self.total_ns = self.total_ns.saturating_add(duration_ns);
+        self.min_ns = self.min_ns.min(duration_ns);
+        self.max_ns = self.max_ns.max(duration_ns);
+    }
+
+    fn average_ns(self) -> u64 {
+        if self.count == 0 {
+            0
+        } else {
+            self.total_ns / self.count
+        }
+    }
+}
+
+#[cfg(feature = "multi-block-test")]
+#[derive(Clone, Copy)]
+struct MultiBlockProfileStats {
+    phases: [MultiBlockPhaseStats; MultiBlockPhase::COUNT],
+}
+
+#[cfg(feature = "multi-block-test")]
+impl MultiBlockProfileStats {
+    const fn new() -> Self {
+        Self {
+            phases: [MultiBlockPhaseStats::new(); MultiBlockPhase::COUNT],
+        }
+    }
+
+    fn record(&mut self, sample: &[u64; MultiBlockPhase::COUNT]) {
+        for phase in MultiBlockPhase::ALL {
+            self.phases[phase as usize].record(sample[phase as usize]);
+        }
+    }
+}
+
+#[cfg(feature = "multi-block-test")]
+struct MultiBlockProfiler {
+    enabled: bool,
+    operation: MultiBlockOperation,
+    request_start_ns: u64,
+    current: [u64; MultiBlockPhase::COUNT],
+    read: MultiBlockProfileStats,
+    write: MultiBlockProfileStats,
+}
+
+#[cfg(feature = "multi-block-test")]
+impl MultiBlockProfiler {
+    const fn new() -> Self {
+        Self {
+            enabled: false,
+            operation: MultiBlockOperation::Read,
+            request_start_ns: 0,
+            current: [0; MultiBlockPhase::COUNT],
+            read: MultiBlockProfileStats::new(),
+            write: MultiBlockProfileStats::new(),
+        }
+    }
+
+    fn begin(&mut self, operation: MultiBlockOperation) {
+        if !self.enabled {
+            return;
+        }
+        self.operation = operation;
+        self.current.fill(0);
+        self.request_start_ns = axhal::time::monotonic_time_nanos();
+    }
+
+    fn add(&mut self, phase: MultiBlockPhase, duration_ns: u64) {
+        if self.enabled {
+            self.current[phase as usize] = self.current[phase as usize].saturating_add(duration_ns);
+        }
+    }
+
+    fn finish(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        let total_ns = axhal::time::monotonic_time_nanos()
+            .saturating_sub(self.request_start_ns)
+            .max(1);
+        self.current[MultiBlockPhase::Total as usize] = total_ns;
+        let accounted_ns = MultiBlockPhase::ALL
+            .iter()
+            .copied()
+            .filter(|phase| !matches!(phase, MultiBlockPhase::Total | MultiBlockPhase::Unaccounted))
+            .map(|phase| self.current[phase as usize] as u128)
+            .sum::<u128>();
+        self.current[MultiBlockPhase::Unaccounted as usize] =
+            total_ns.saturating_sub(accounted_ns.min(u64::MAX as u128) as u64);
+
+        match self.operation {
+            MultiBlockOperation::Read => self.read.record(&self.current),
+            MultiBlockOperation::Write => self.write.record(&self.current),
+        }
+    }
+
+    fn take(&mut self, operation: MultiBlockOperation) -> MultiBlockProfileStats {
+        match operation {
+            MultiBlockOperation::Read => {
+                let stats = self.read;
+                self.read = MultiBlockProfileStats::new();
+                stats
+            }
+            MultiBlockOperation::Write => {
+                let stats = self.write;
+                self.write = MultiBlockProfileStats::new();
+                stats
+            }
+        }
+    }
+}
 
 fn wait_until<F>(mut f: F)
 where
@@ -111,6 +344,7 @@ struct IdmacTransferContext {
     dma_desc_info: DMAInfo,
     layout: Layout,
     desc_ptr: *mut IdmacDescriptor,
+    descriptor_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -159,6 +393,9 @@ pub struct SdMmc {
 
     /// The DMA buffer must be retained if hardware could not be stopped.
     idmac_reset_failed: bool,
+
+    #[cfg(feature = "multi-block-test")]
+    multi_block_profiler: MultiBlockProfiler,
 }
 
 struct ActiveIdmacTransfer<'a> {
@@ -178,16 +415,23 @@ impl<'a> ActiveIdmacTransfer<'a> {
         self.context.as_ref().unwrap()
     }
 
-    fn wait_sync(&self) -> Result<(), IdmacWaitError> {
-        self.sdmmc.wait_transfer_sync(self.context())
+    fn wait_sync(&mut self) -> Result<(), IdmacWaitError> {
+        let context = self.context.as_ref().unwrap();
+        self.sdmmc.wait_transfer_sync(context)
     }
 
     async fn wait_async(&self) -> Result<(), IdmacWaitError> {
         self.sdmmc.wait_transfer_async(self.context()).await
     }
 
-    fn validate(&self) -> bool {
-        self.sdmmc.validate_idmac_terminal(self.context())
+    fn validate(&mut self) -> bool {
+        #[cfg(feature = "multi-block-test")]
+        let phase_start = self.sdmmc.multi_block_phase_start();
+        let valid = self.sdmmc.validate_idmac_terminal(self.context());
+        #[cfg(feature = "multi-block-test")]
+        self.sdmmc
+            .multi_block_phase_finish(MultiBlockPhase::TerminalValidate, phase_start);
+        valid
     }
 
     fn response(&self) -> [u32; 4] {
@@ -199,8 +443,14 @@ impl<'a> ActiveIdmacTransfer<'a> {
     }
 
     fn finish(mut self, recover: bool) -> bool {
+        #[cfg(feature = "multi-block-test")]
+        let phase_start = self.sdmmc.multi_block_phase_start();
         let context = self.context.take().unwrap();
-        self.sdmmc.finish_idmac_transfer(context, recover)
+        let finished = self.sdmmc.finish_idmac_transfer(context, recover);
+        #[cfg(feature = "multi-block-test")]
+        self.sdmmc
+            .multi_block_phase_finish(MultiBlockPhase::FinishCleanup, phase_start);
+        finished
     }
 }
 
@@ -237,11 +487,406 @@ impl SdMmc {
             dma_buffer: None,
             idmac_faulted: false,
             idmac_reset_failed: false,
+            #[cfg(feature = "multi-block-test")]
+            multi_block_profiler: MultiBlockProfiler::new(),
         };
         this.init();
-        this.try_enable_idmac(512, AHBDataWidth::Bits32, register_irq);
+        this.try_enable_idmac(DMA_BUFFER_SIZE, AHBDataWidth::Bits32, register_irq);
+        #[cfg(feature = "multi-block-test")]
+        this.run_multi_block_test();
 
         this
+    }
+
+    #[cfg(feature = "multi-block-test")]
+    fn multi_block_phase_start(&self) -> Option<u64> {
+        self.multi_block_profiler
+            .enabled
+            .then(axhal::time::monotonic_time_nanos)
+    }
+
+    #[cfg(feature = "multi-block-test")]
+    fn multi_block_phase_finish(&mut self, phase: MultiBlockPhase, started_ns: Option<u64>) {
+        if let Some(started_ns) = started_ns {
+            self.multi_block_profiler.add(
+                phase,
+                axhal::time::monotonic_time_nanos().saturating_sub(started_ns),
+            );
+        }
+    }
+
+    #[cfg(feature = "multi-block-test")]
+    fn multi_block_test_read_single(&mut self, buffer: &mut [u8]) {
+        assert_eq!(buffer.len(), MULTI_BLOCK_TEST_BLOCKS * Self::BLOCK_SIZE);
+        for (block_index, block) in buffer.chunks_mut(Self::BLOCK_SIZE).enumerate() {
+            self.read_block(
+                MULTI_BLOCK_TEST_START_LBA + block_index as u32,
+                block.try_into().unwrap(),
+            );
+        }
+    }
+
+    #[cfg(feature = "multi-block-test")]
+    fn multi_block_test_write_single(&mut self, buffer: &[u8]) {
+        assert_eq!(buffer.len(), MULTI_BLOCK_TEST_BLOCKS * Self::BLOCK_SIZE);
+        for (block_index, block) in buffer.chunks(Self::BLOCK_SIZE).enumerate() {
+            self.write_block(
+                MULTI_BLOCK_TEST_START_LBA + block_index as u32,
+                block.try_into().unwrap(),
+            );
+        }
+    }
+
+    #[cfg(feature = "multi-block-test")]
+    fn multi_block_fill_pattern(buffer: &mut [u8], tag: u8) {
+        for (block_index, block) in buffer.chunks_mut(Self::BLOCK_SIZE).enumerate() {
+            let lba = MULTI_BLOCK_TEST_START_LBA + block_index as u32;
+            let lba_bytes = lba.to_le_bytes();
+            for (byte_index, byte) in block.iter_mut().enumerate() {
+                *byte = lba_bytes[byte_index % lba_bytes.len()]
+                    .wrapping_add((byte_index as u8).wrapping_mul(31))
+                    .wrapping_add(tag);
+            }
+        }
+    }
+
+    #[cfg(feature = "multi-block-test")]
+    fn multi_block_first_mismatch(actual: &[u8], expected: &[u8]) -> Option<(usize, u8, u8)> {
+        assert_eq!(actual.len(), expected.len());
+        actual
+            .iter()
+            .copied()
+            .zip(expected.iter().copied())
+            .enumerate()
+            .find_map(|(index, (actual, expected))| {
+                (actual != expected).then_some((index, expected, actual))
+            })
+    }
+
+    #[cfg(feature = "multi-block-test")]
+    fn multi_block_percentile(sorted: &[u64], percentile: usize) -> u64 {
+        let rank = (sorted.len() * percentile).div_ceil(100);
+        sorted[rank.saturating_sub(1)]
+    }
+
+    #[cfg(feature = "multi-block-test")]
+    fn multi_block_print_round(
+        operation: MultiBlockOperation,
+        request_blocks: usize,
+        round: usize,
+        mut latencies_ns: Vec<u64>,
+        validation_ok: bool,
+    ) {
+        let requests = MULTI_BLOCK_TEST_BLOCKS / request_blocks;
+        assert_eq!(latencies_ns.len(), requests);
+        let elapsed_ns = latencies_ns.iter().copied().sum::<u64>().max(1);
+        let bytes = (MULTI_BLOCK_TEST_BLOCKS * Self::BLOCK_SIZE) as u128;
+        let throughput_milli =
+            (bytes * 1_000_000_000 * 1_000 / (elapsed_ns as u128 * 1_048_576)) as u64;
+        let average_ns = elapsed_ns / requests as u64;
+        latencies_ns.sort_unstable();
+        let p50_ns = Self::multi_block_percentile(&latencies_ns, 50);
+        let p95_ns = Self::multi_block_percentile(&latencies_ns, 95);
+        let p99_ns = Self::multi_block_percentile(&latencies_ns, 99);
+        let max_ns = *latencies_ns.last().unwrap();
+        let command = if request_blocks == 1 {
+            match operation {
+                MultiBlockOperation::Read => "CMD17",
+                MultiBlockOperation::Write => "CMD24",
+            }
+        } else {
+            match operation {
+                MultiBlockOperation::Read => "CMD18+AutoCMD12",
+                MultiBlockOperation::Write => "CMD25+AutoCMD12",
+            }
+        };
+        let descriptor_count =
+            (request_blocks * Self::BLOCK_SIZE).div_ceil(IDMAC_DESCRIPTOR_BUFFER_SIZE);
+
+        warn!(
+            "MULTI_BLOCK_ROUND operation={} request_blocks={} round={} command={} descriptors={} \
+             requests={} bytes={} elapsed_ns={} throughput_mib_s={}.{:03} average_request_ns={} \
+             average_block_ns={} p50_ns={} p95_ns={} p99_ns={} max_ns={} validation={}",
+            operation.name(),
+            request_blocks,
+            round,
+            command,
+            descriptor_count,
+            requests,
+            bytes,
+            elapsed_ns,
+            throughput_milli / 1_000,
+            throughput_milli % 1_000,
+            average_ns,
+            elapsed_ns / MULTI_BLOCK_TEST_BLOCKS as u64,
+            p50_ns,
+            p95_ns,
+            p99_ns,
+            max_ns,
+            if validation_ok { "ok" } else { "failed" },
+        );
+    }
+
+    #[cfg(feature = "multi-block-test")]
+    fn multi_block_print_profile(
+        operation: MultiBlockOperation,
+        request_blocks: usize,
+        stats: MultiBlockProfileStats,
+    ) {
+        let total_ns = stats.phases[MultiBlockPhase::Total as usize]
+            .total_ns
+            .max(1);
+        for phase in MultiBlockPhase::ALL {
+            let phase_stats = stats.phases[phase as usize];
+            if phase_stats.count == 0 {
+                continue;
+            }
+            let percent_milli = (phase_stats.total_ns as u128 * 100_000 / total_ns as u128) as u64;
+            warn!(
+                "MULTI_BLOCK_PHASE operation={} request_blocks={} phase={} count={} total_ns={} \
+                 average_ns={} min_ns={} max_ns={} percent={}.{:03}",
+                operation.name(),
+                request_blocks,
+                phase.name(),
+                phase_stats.count,
+                phase_stats.total_ns,
+                phase_stats.average_ns(),
+                if phase_stats.min_ns == u64::MAX {
+                    0
+                } else {
+                    phase_stats.min_ns
+                },
+                phase_stats.max_ns,
+                percent_milli / 1_000,
+                percent_milli % 1_000,
+            );
+        }
+    }
+
+    #[cfg(feature = "multi-block-test")]
+    fn multi_block_measure_read(
+        &mut self,
+        request_blocks: usize,
+        expected: &[u8],
+        transfer: &mut [u8],
+    ) -> bool {
+        let request_bytes = request_blocks * Self::BLOCK_SIZE;
+        let requests = MULTI_BLOCK_TEST_BLOCKS / request_blocks;
+        let _ = self.multi_block_profiler.take(MultiBlockOperation::Read);
+
+        let mut all_valid = true;
+        for round in 1..=MULTI_BLOCK_TEST_ROUNDS {
+            transfer.fill(0);
+            let mut latencies_ns = Vec::with_capacity(requests);
+            self.multi_block_profiler.enabled = true;
+            for request in 0..requests {
+                let block_offset = request * request_blocks;
+                let byte_offset = request * request_bytes;
+                let start_ns = axhal::time::monotonic_time_nanos();
+                self.read_blocks(
+                    MULTI_BLOCK_TEST_START_LBA + block_offset as u32,
+                    &mut transfer[byte_offset..byte_offset + request_bytes],
+                );
+                latencies_ns.push(
+                    axhal::time::monotonic_time_nanos()
+                        .saturating_sub(start_ns)
+                        .max(1),
+                );
+            }
+            self.multi_block_profiler.enabled = false;
+            let mismatch = Self::multi_block_first_mismatch(transfer, expected);
+            if let Some((offset, expected, actual)) = mismatch {
+                all_valid = false;
+                warn!(
+                    "MULTI_BLOCK_MISMATCH operation=read request_blocks={} round={} offset={} \
+                     lba={} byte_in_block={} expected=0x{:02x} actual=0x{:02x}",
+                    request_blocks,
+                    round,
+                    offset,
+                    MULTI_BLOCK_TEST_START_LBA + (offset / Self::BLOCK_SIZE) as u32,
+                    offset % Self::BLOCK_SIZE,
+                    expected,
+                    actual,
+                );
+            }
+            Self::multi_block_print_round(
+                MultiBlockOperation::Read,
+                request_blocks,
+                round,
+                latencies_ns,
+                mismatch.is_none(),
+            );
+        }
+
+        let profile = self.multi_block_profiler.take(MultiBlockOperation::Read);
+        Self::multi_block_print_profile(MultiBlockOperation::Read, request_blocks, profile);
+        all_valid
+    }
+
+    #[cfg(feature = "multi-block-test")]
+    fn multi_block_measure_write(
+        &mut self,
+        size_index: usize,
+        request_blocks: usize,
+        expected: &mut [u8],
+        verify: &mut [u8],
+    ) -> bool {
+        let request_bytes = request_blocks * Self::BLOCK_SIZE;
+        let requests = MULTI_BLOCK_TEST_BLOCKS / request_blocks;
+        let _ = self.multi_block_profiler.take(MultiBlockOperation::Write);
+
+        let mut all_valid = true;
+        for round in 1..=MULTI_BLOCK_TEST_ROUNDS {
+            Self::multi_block_fill_pattern(
+                expected,
+                0x40u8
+                    .wrapping_add((size_index as u8).wrapping_mul(16))
+                    .wrapping_add(round as u8),
+            );
+            let mut latencies_ns = Vec::with_capacity(requests);
+            self.multi_block_profiler.enabled = true;
+            for request in 0..requests {
+                let block_offset = request * request_blocks;
+                let byte_offset = request * request_bytes;
+                let start_ns = axhal::time::monotonic_time_nanos();
+                self.write_blocks(
+                    MULTI_BLOCK_TEST_START_LBA + block_offset as u32,
+                    &expected[byte_offset..byte_offset + request_bytes],
+                );
+                latencies_ns.push(
+                    axhal::time::monotonic_time_nanos()
+                        .saturating_sub(start_ns)
+                        .max(1),
+                );
+            }
+            self.multi_block_profiler.enabled = false;
+
+            self.multi_block_test_read_single(verify);
+            let mismatch = Self::multi_block_first_mismatch(verify, expected);
+            if let Some((offset, expected, actual)) = mismatch {
+                all_valid = false;
+                warn!(
+                    "MULTI_BLOCK_MISMATCH operation=write request_blocks={} round={} offset={} \
+                     lba={} byte_in_block={} expected=0x{:02x} actual=0x{:02x}",
+                    request_blocks,
+                    round,
+                    offset,
+                    MULTI_BLOCK_TEST_START_LBA + (offset / Self::BLOCK_SIZE) as u32,
+                    offset % Self::BLOCK_SIZE,
+                    expected,
+                    actual,
+                );
+            }
+            Self::multi_block_print_round(
+                MultiBlockOperation::Write,
+                request_blocks,
+                round,
+                latencies_ns,
+                mismatch.is_none(),
+            );
+        }
+
+        let profile = self.multi_block_profiler.take(MultiBlockOperation::Write);
+        Self::multi_block_print_profile(MultiBlockOperation::Write, request_blocks, profile);
+        all_valid
+    }
+
+    #[cfg(feature = "multi-block-test")]
+    fn run_multi_block_test(&mut self) {
+        let test_end_lba = MULTI_BLOCK_TEST_START_LBA + MULTI_BLOCK_TEST_BLOCKS as u32 - 1;
+        assert!(
+            test_end_lba as u64 + 1 <= self.num_blocks,
+            "multi-block-test region exceeds the detected card capacity"
+        );
+        assert!(
+            self.dma_buffer
+                .as_ref()
+                .is_some_and(|buffer| buffer.size >= DMA_BUFFER_SIZE),
+            "multi-block-test requires a 16 KiB IDMAC bounce buffer"
+        );
+        for request_blocks in MULTI_BLOCK_REQUEST_SIZES {
+            assert_eq!(MULTI_BLOCK_TEST_BLOCKS % request_blocks, 0);
+            assert!(request_blocks * Self::BLOCK_SIZE <= DMA_BUFFER_SIZE);
+        }
+
+        warn!(
+            "MULTI_BLOCK_TEST begin start_lba={} end_lba={} blocks={} bytes={} rounds={} \
+             request_blocks=1,2,4,8,16,32 bus_width_bits=1 card_clock_hz={} destructive=true \
+             restore_on_normal_completion=true",
+            MULTI_BLOCK_TEST_START_LBA,
+            test_end_lba,
+            MULTI_BLOCK_TEST_BLOCKS,
+            MULTI_BLOCK_TEST_BLOCKS * Self::BLOCK_SIZE,
+            MULTI_BLOCK_TEST_ROUNDS,
+            VISIONFIVE2_SDIO_CIU_CLOCK_HZ / (2 * DEFAULT_SPEED_CLOCK_DIVIDER as u32),
+        );
+
+        let region_bytes = MULTI_BLOCK_TEST_BLOCKS * Self::BLOCK_SIZE;
+        let mut backup = vec![0u8; region_bytes];
+        let mut expected = vec![0u8; region_bytes];
+        let mut transfer = vec![0u8; region_bytes];
+
+        self.multi_block_profiler.enabled = false;
+        warn!("MULTI_BLOCK_TEST stage=backup status=begin method=CMD17");
+        self.multi_block_test_read_single(&mut backup);
+        self.multi_block_test_read_single(&mut transfer);
+        assert!(
+            Self::multi_block_first_mismatch(&transfer, &backup).is_none(),
+            "multi-block-test backup could not be reproduced with CMD17"
+        );
+        warn!("MULTI_BLOCK_TEST stage=backup status=verified");
+
+        let mut test_failed = false;
+        for request_blocks in MULTI_BLOCK_REQUEST_SIZES {
+            self.multi_block_profiler.enabled = false;
+            for request in 0..(MULTI_BLOCK_TEST_BLOCKS / request_blocks) {
+                let block_offset = request * request_blocks;
+                let byte_offset = block_offset * Self::BLOCK_SIZE;
+                let request_bytes = request_blocks * Self::BLOCK_SIZE;
+                self.read_blocks(
+                    MULTI_BLOCK_TEST_START_LBA + block_offset as u32,
+                    &mut transfer[byte_offset..byte_offset + request_bytes],
+                );
+            }
+            if Self::multi_block_first_mismatch(&transfer, &backup).is_some() {
+                warn!(
+                    "MULTI_BLOCK_TEST read warmup failed request_blocks={}",
+                    request_blocks
+                );
+                test_failed = true;
+            }
+            test_failed |= !self.multi_block_measure_read(request_blocks, &backup, &mut transfer);
+        }
+
+        for (size_index, request_blocks) in MULTI_BLOCK_REQUEST_SIZES.into_iter().enumerate() {
+            test_failed |= !self.multi_block_measure_write(
+                size_index,
+                request_blocks,
+                &mut expected,
+                &mut transfer,
+            );
+        }
+
+        self.multi_block_profiler.enabled = false;
+        warn!("MULTI_BLOCK_TEST stage=restore status=begin method=CMD24");
+        self.multi_block_test_write_single(&backup);
+        self.multi_block_test_read_single(&mut transfer);
+        if let Some((offset, expected, actual)) =
+            Self::multi_block_first_mismatch(&transfer, &backup)
+        {
+            panic!(
+                "multi-block-test RESTORE FAILED at byte {} (LBA {}, byte {}): expected=0x{:02x}, \
+                 actual=0x{:02x}",
+                offset,
+                MULTI_BLOCK_TEST_START_LBA + (offset / Self::BLOCK_SIZE) as u32,
+                offset % Self::BLOCK_SIZE,
+                expected,
+                actual,
+            );
+        }
+        warn!("MULTI_BLOCK_TEST stage=restore status=verified");
+        assert!(!test_failed, "multi-block-test detected data mismatches");
+        warn!("MULTI_BLOCK_TEST complete status=ok original_region_restored=true");
     }
 
     fn can_send_cmd(&self) -> bool {
@@ -336,7 +981,9 @@ impl SdMmc {
                     .with_ri(true)
                     .with_ti(true),
             );
-            self.regs.intmask().update(|r| r.with_dto(true));
+            self.regs
+                .intmask()
+                .update(|r| r.with_acd(true).with_dto(true));
             dma_io_fence();
         }
 
@@ -791,86 +1438,241 @@ impl SdMmc {
         info!("SD/MMC driver initialized");
     }
 
+    fn validate_block_buffer(&self, block: u32, len: usize) -> usize {
+        assert!(len != 0, "SD/MMC transfer buffer must not be empty");
+        assert_eq!(
+            len % Self::BLOCK_SIZE,
+            0,
+            "SD/MMC transfer length must be block aligned"
+        );
+        let blocks = len / Self::BLOCK_SIZE;
+        let end = block as u64 + blocks as u64;
+        assert!(
+            end <= self.num_blocks,
+            "SD/MMC transfer range exceeds card capacity"
+        );
+        blocks
+    }
+
+    fn read_dma_chunk(&mut self, block: u32, buf: &mut [u8]) {
+        debug_assert!(buf.len() <= DMA_BUFFER_SIZE);
+        #[cfg(feature = "multi-block-test")]
+        self.multi_block_profiler.begin(MultiBlockOperation::Read);
+        #[cfg(feature = "multi-block-test")]
+        let phase_start = self.multi_block_phase_start();
+        self.set_transaction_size(Self::BLOCK_SIZE as u16, buf.len() as u32);
+        #[cfg(feature = "multi-block-test")]
+        self.multi_block_phase_finish(MultiBlockPhase::TransactionConfig, phase_start);
+
+        let dma_buf_info = self
+            .dma_buffer
+            .as_ref()
+            .expect("synchronous DMA read requested without an IDMAC buffer");
+        let dma_buf_virt_ptr = dma_buf_info.addr.cpu_addr.as_ptr();
+        let dma_bus_addr = u32::try_from(dma_buf_info.addr.bus_addr.as_u64())
+            .expect("DMA buffer address exceeds the IDMAC 32-bit address range");
+        let dma_buf = unsafe { core::slice::from_raw_parts_mut(dma_buf_virt_ptr, buf.len()) };
+        let command = if buf.len() == Self::BLOCK_SIZE {
+            Command::ReadSingleBlock(block, dma_buf)
+        } else {
+            Command::ReadMultipleBlocks(block, dma_buf)
+        };
+        self.send_cmd_idmac(command, dma_bus_addr)
+            .expect("synchronous IDMAC read failed");
+
+        #[cfg(feature = "multi-block-test")]
+        let phase_start = self.multi_block_phase_start();
+        let dma_usr_slice = unsafe { core::slice::from_raw_parts(dma_buf_virt_ptr, buf.len()) };
+        buf.copy_from_slice(dma_usr_slice);
+        #[cfg(feature = "multi-block-test")]
+        self.multi_block_phase_finish(MultiBlockPhase::BounceCopy, phase_start);
+        #[cfg(feature = "multi-block-test")]
+        self.multi_block_profiler.finish();
+    }
+
+    async fn read_dma_chunk_async(&mut self, block: u32, buf: &mut [u8]) {
+        debug_assert!(buf.len() <= DMA_BUFFER_SIZE);
+        self.set_transaction_size(Self::BLOCK_SIZE as u16, buf.len() as u32);
+
+        let dma_buf_info = self
+            .dma_buffer
+            .as_ref()
+            .expect("asynchronous DMA read requested without an IDMAC buffer");
+        let dma_buf_virt_ptr = dma_buf_info.addr.cpu_addr.as_ptr();
+        let dma_bus_addr = u32::try_from(dma_buf_info.addr.bus_addr.as_u64())
+            .expect("DMA buffer address exceeds the IDMAC 32-bit address range");
+        let dma_buf = unsafe { core::slice::from_raw_parts_mut(dma_buf_virt_ptr, buf.len()) };
+        let command = if buf.len() == Self::BLOCK_SIZE {
+            Command::ReadSingleBlock(block, dma_buf)
+        } else {
+            Command::ReadMultipleBlocks(block, dma_buf)
+        };
+        self.send_cmd_idmac_async(command, dma_bus_addr)
+            .await
+            .expect("asynchronous IDMAC read failed");
+
+        let dma_usr_slice = unsafe { core::slice::from_raw_parts(dma_buf_virt_ptr, buf.len()) };
+        buf.copy_from_slice(dma_usr_slice);
+    }
+
+    fn wait_card_ready_after_write(&mut self) {
+        #[cfg(feature = "multi-block-test")]
+        let phase_start = self.multi_block_phase_start();
+        let deadline = axhal::time::monotonic_time() + Duration::from_secs(5);
+        while !self.can_send_data() {
+            if axhal::time::monotonic_time() >= deadline {
+                #[cfg(feature = "multi-block-test")]
+                self.multi_block_phase_finish(MultiBlockPhase::CardBusy, phase_start);
+                self.idmac_faulted = true;
+                panic!("SD/MMC card stayed busy after write");
+            }
+            core::hint::spin_loop();
+        }
+        #[cfg(feature = "multi-block-test")]
+        self.multi_block_phase_finish(MultiBlockPhase::CardBusy, phase_start);
+    }
+
+    fn write_dma_chunk(&mut self, block: u32, buf: &[u8]) {
+        debug_assert!(buf.len() <= DMA_BUFFER_SIZE);
+        #[cfg(feature = "multi-block-test")]
+        self.multi_block_profiler.begin(MultiBlockOperation::Write);
+        #[cfg(feature = "multi-block-test")]
+        let phase_start = self.multi_block_phase_start();
+        self.set_transaction_size(Self::BLOCK_SIZE as u16, buf.len() as u32);
+        #[cfg(feature = "multi-block-test")]
+        self.multi_block_phase_finish(MultiBlockPhase::TransactionConfig, phase_start);
+
+        let dma_buf_info = self
+            .dma_buffer
+            .as_ref()
+            .expect("synchronous DMA write requested without an IDMAC buffer");
+        let dma_buf_virt_ptr = dma_buf_info.addr.cpu_addr.as_ptr();
+        let dma_bus_addr = u32::try_from(dma_buf_info.addr.bus_addr.as_u64())
+            .expect("DMA buffer address exceeds the IDMAC 32-bit address range");
+        #[cfg(feature = "multi-block-test")]
+        let phase_start = self.multi_block_phase_start();
+        let dma_usr_slice = unsafe { core::slice::from_raw_parts_mut(dma_buf_virt_ptr, buf.len()) };
+        dma_usr_slice.copy_from_slice(buf);
+        #[cfg(feature = "multi-block-test")]
+        self.multi_block_phase_finish(MultiBlockPhase::BounceCopy, phase_start);
+
+        let dma_buf = unsafe { core::slice::from_raw_parts(dma_buf_virt_ptr, buf.len()) };
+        let command = if buf.len() == Self::BLOCK_SIZE {
+            Command::WriteSingleBlock(block, dma_buf)
+        } else {
+            Command::WriteMultipleBlocks(block, dma_buf)
+        };
+        self.send_cmd_idmac(command, dma_bus_addr)
+            .expect("synchronous IDMAC write failed");
+        self.wait_card_ready_after_write();
+        #[cfg(feature = "multi-block-test")]
+        self.multi_block_profiler.finish();
+    }
+
+    async fn write_dma_chunk_async(&mut self, block: u32, buf: &[u8]) {
+        debug_assert!(buf.len() <= DMA_BUFFER_SIZE);
+        self.set_transaction_size(Self::BLOCK_SIZE as u16, buf.len() as u32);
+
+        let dma_buf_info = self
+            .dma_buffer
+            .as_ref()
+            .expect("asynchronous DMA write requested without an IDMAC buffer");
+        let dma_buf_virt_ptr = dma_buf_info.addr.cpu_addr.as_ptr();
+        let dma_usr_slice = unsafe { core::slice::from_raw_parts_mut(dma_buf_virt_ptr, buf.len()) };
+        dma_usr_slice.copy_from_slice(buf);
+
+        let dma_bus_addr = u32::try_from(dma_buf_info.addr.bus_addr.as_u64())
+            .expect("DMA buffer address exceeds the IDMAC 32-bit address range");
+        let dma_buf = unsafe { core::slice::from_raw_parts(dma_buf_virt_ptr, buf.len()) };
+        let command = if buf.len() == Self::BLOCK_SIZE {
+            Command::WriteSingleBlock(block, dma_buf)
+        } else {
+            Command::WriteMultipleBlocks(block, dma_buf)
+        };
+        self.send_cmd_idmac_async(command, dma_bus_addr)
+            .await
+            .expect("asynchronous IDMAC write failed");
+        self.wait_card_ready_after_write();
+    }
+
+    /// Reads one or more contiguous blocks from the SD/MMC card.
+    pub fn read_blocks(&mut self, mut block: u32, buf: &mut [u8]) {
+        let mut remaining_blocks = self.validate_block_buffer(block, buf.len());
+        for chunk in buf.chunks_mut(DMA_BUFFER_SIZE) {
+            self.read_dma_chunk(block, chunk);
+            let chunk_blocks = chunk.len() / Self::BLOCK_SIZE;
+            remaining_blocks -= chunk_blocks;
+            if remaining_blocks != 0 {
+                block = block
+                    .checked_add(chunk_blocks as u32)
+                    .expect("SD/MMC read block address overflow");
+            }
+        }
+    }
+
+    /// Reads one or more contiguous blocks and asynchronously waits for each DMA chunk.
+    pub async fn read_blocks_async(&mut self, mut block: u32, buf: &mut [u8]) {
+        let mut remaining_blocks = self.validate_block_buffer(block, buf.len());
+        for chunk in buf.chunks_mut(DMA_BUFFER_SIZE) {
+            self.read_dma_chunk_async(block, chunk).await;
+            let chunk_blocks = chunk.len() / Self::BLOCK_SIZE;
+            remaining_blocks -= chunk_blocks;
+            if remaining_blocks != 0 {
+                block = block
+                    .checked_add(chunk_blocks as u32)
+                    .expect("SD/MMC asynchronous read block address overflow");
+            }
+        }
+    }
+
+    /// Writes one or more contiguous blocks to the SD/MMC card.
+    pub fn write_blocks(&mut self, mut block: u32, buf: &[u8]) {
+        let mut remaining_blocks = self.validate_block_buffer(block, buf.len());
+        for chunk in buf.chunks(DMA_BUFFER_SIZE) {
+            self.write_dma_chunk(block, chunk);
+            let chunk_blocks = chunk.len() / Self::BLOCK_SIZE;
+            remaining_blocks -= chunk_blocks;
+            if remaining_blocks != 0 {
+                block = block
+                    .checked_add(chunk_blocks as u32)
+                    .expect("SD/MMC write block address overflow");
+            }
+        }
+    }
+
+    /// Writes one or more contiguous blocks and asynchronously waits for each DMA chunk.
+    pub async fn write_blocks_async(&mut self, mut block: u32, buf: &[u8]) {
+        let mut remaining_blocks = self.validate_block_buffer(block, buf.len());
+        for chunk in buf.chunks(DMA_BUFFER_SIZE) {
+            self.write_dma_chunk_async(block, chunk).await;
+            let chunk_blocks = chunk.len() / Self::BLOCK_SIZE;
+            remaining_blocks -= chunk_blocks;
+            if remaining_blocks != 0 {
+                block = block
+                    .checked_add(chunk_blocks as u32)
+                    .expect("SD/MMC asynchronous write block address overflow");
+            }
+        }
+    }
+
     /// Reads a single block from the SD/MMC card.
     pub fn read_block(&mut self, block: u32, buf: &mut [u8; 512]) {
-        self.set_transaction_size(512, 512);
-
-        if let Some(dma_buf_info) = &self.dma_buffer {
-            let dma_buf_virt_ptr = dma_buf_info.addr.cpu_addr.as_ptr();
-            let dma_buf = unsafe { core::slice::from_raw_parts_mut(dma_buf_virt_ptr, buf.len()) };
-            let dma_bus_addr = u32::try_from(dma_buf_info.addr.bus_addr.as_u64())
-                .expect("DMA buffer address exceeds the IDMAC 32-bit address range");
-
-            self.send_cmd_idmac(Command::ReadSingleBlock(block, dma_buf), dma_bus_addr)
-                .unwrap();
-
-            let dma_usr_slice = unsafe { core::slice::from_raw_parts(dma_buf_virt_ptr, buf.len()) };
-            buf.copy_from_slice(dma_usr_slice);
-        } else {
-            panic!("synchronous DMA read requested without an IDMAC buffer");
-        }
+        self.read_blocks(block, buf);
     }
 
     /// Reads a single block using IDMAC and asynchronously waits for completion.
     pub async fn read_block_async(&mut self, block: u32, buf: &mut [u8; 512]) {
-        self.set_transaction_size(512, 512);
-
-        if let Some(dma_buf_info) = &self.dma_buffer {
-            let dma_buf_virt_ptr = dma_buf_info.addr.cpu_addr.as_ptr();
-            let dma_buf = unsafe { core::slice::from_raw_parts_mut(dma_buf_virt_ptr, buf.len()) };
-            let dma_bus_addr = u32::try_from(dma_buf_info.addr.bus_addr.as_u64())
-                .expect("DMA buffer address exceeds the IDMAC 32-bit address range");
-
-            self.send_cmd_idmac_async(Command::ReadSingleBlock(block, dma_buf), dma_bus_addr)
-                .await
-                .expect("asynchronous IDMAC read failed; benchmark must stop");
-
-            let dma_usr_slice = unsafe { core::slice::from_raw_parts(dma_buf_virt_ptr, buf.len()) };
-            buf.copy_from_slice(dma_usr_slice);
-        } else {
-            panic!("asynchronous DMA read requested without an IDMAC buffer");
-        }
+        self.read_blocks_async(block, buf).await;
     }
 
     /// Writes a single block to the SD/MMC card.
     pub fn write_block(&mut self, block: u32, buf: &[u8; 512]) {
-        self.set_transaction_size(512, 512);
-
-        if let Some(dma_buf_info) = &self.dma_buffer {
-            let dma_buf_virt_ptr = dma_buf_info.addr.cpu_addr.as_ptr();
-            let dma_usr_slice =
-                unsafe { core::slice::from_raw_parts_mut(dma_buf_virt_ptr, buf.len()) };
-            dma_usr_slice.copy_from_slice(buf);
-
-            let dma_buf = unsafe { core::slice::from_raw_parts(dma_buf_virt_ptr, buf.len()) };
-            let dma_bus_addr = u32::try_from(dma_buf_info.addr.bus_addr.as_u64())
-                .expect("DMA buffer address exceeds the IDMAC 32-bit address range");
-            self.send_cmd_idmac(Command::WriteSingleBlock(block, dma_buf), dma_bus_addr)
-                .unwrap();
-        } else {
-            panic!("synchronous DMA write requested without an IDMAC buffer");
-        }
+        self.write_blocks(block, buf);
     }
 
     /// Writes a single block using IDMAC and asynchronously waits for completion.
     pub async fn write_block_async(&mut self, block: u32, buf: &[u8; 512]) {
-        self.set_transaction_size(512, 512);
-
-        if let Some(dma_buf_info) = &self.dma_buffer {
-            let dma_buf_virt_ptr = dma_buf_info.addr.cpu_addr.as_ptr();
-            let dma_usr_slice =
-                unsafe { core::slice::from_raw_parts_mut(dma_buf_virt_ptr, buf.len()) };
-            dma_usr_slice.copy_from_slice(buf);
-
-            let dma_buf = unsafe { core::slice::from_raw_parts(dma_buf_virt_ptr, buf.len()) };
-            let dma_bus_addr = u32::try_from(dma_buf_info.addr.bus_addr.as_u64())
-                .expect("DMA buffer address exceeds the IDMAC 32-bit address range");
-            self.send_cmd_idmac_async(Command::WriteSingleBlock(block, dma_buf), dma_bus_addr)
-                .await
-                .expect("asynchronous IDMAC write failed; benchmark must stop");
-        } else {
-            panic!("asynchronous DMA write requested without an IDMAC buffer");
-        }
+        self.write_blocks_async(block, buf).await;
     }
 
     /// Returns the number of blocks.
@@ -932,6 +1734,7 @@ impl SdMmc {
         let rintsts_before_enable = self.regs.rintsts().read();
         let idsts_before_enable = self.regs.idsts().read();
         if rintsts_before_enable.error()
+            || rintsts_before_enable.auto_command_done()
             || rintsts_before_enable.data_transfer_over()
             || rintsts_before_enable.receive_fifo_data_request()
             || rintsts_before_enable.transmit_fifo_data_request()
@@ -1010,7 +1813,7 @@ impl SdMmc {
             return;
         }
 
-        // Enable IDMAC completion/error interrupts and controller DTO.
+        // Enable IDMAC completion/error interrupts and controller ACD/DTO.
         self.regs.idinten().write(
             crate::regs::IdIntEn::new()
                 .with_ai(true)
@@ -1023,7 +1826,7 @@ impl SdMmc {
         );
         self.regs
             .intmask()
-            .write(crate::regs::IntMask::new().with_dto(true));
+            .write(crate::regs::IntMask::new().with_acd(true).with_dto(true));
 
         let idinten_after = self.regs.idinten().read();
         let intmask_after = self.regs.intmask().read();
@@ -1041,13 +1844,16 @@ impl SdMmc {
                  register access"
             );
         }
-        if !intmask_after.dto()
+        if !intmask_after.acd()
+            || !intmask_after.dto()
             || intmask_after.cmd()
             || intmask_after.rxdr()
             || intmask_after.txdr()
         {
             warn!(
-                "try_enable_idmac: INTMASK mismatch after write; dto={}, cmd={}, rxdr={}, txdr={}",
+                "try_enable_idmac: INTMASK mismatch after write; acd={}, dto={}, cmd={}, rxdr={}, \
+                 txdr={}",
+                intmask_after.acd(),
                 intmask_after.dto(),
                 intmask_after.cmd(),
                 intmask_after.rxdr(),
@@ -1106,6 +1912,8 @@ impl SdMmc {
             "send_cmd_idmac requires a data buffer for transfer"
         );
 
+        #[cfg(feature = "multi-block-test")]
+        let phase_start = self.multi_block_phase_start();
         let cmd_idle_deadline = axhal::time::monotonic_time() + Duration::from_secs(1);
         while !self.can_send_cmd() {
             if axhal::time::monotonic_time() >= cmd_idle_deadline {
@@ -1138,8 +1946,12 @@ impl SdMmc {
             }
             core::hint::spin_loop();
         }
+        #[cfg(feature = "multi-block-test")]
+        self.multi_block_phase_finish(MultiBlockPhase::IdleWait, phase_start);
 
         // Establish a clean W1C status baseline for the new transaction.
+        #[cfg(feature = "multi-block-test")]
+        let phase_start = self.multi_block_phase_start();
         let stale_rintsts = self.regs.rintsts().read();
         self.regs.rintsts().write(stale_rintsts);
 
@@ -1154,6 +1966,8 @@ impl SdMmc {
         {
             self.clear_idsts();
         }
+        #[cfg(feature = "multi-block-test")]
+        self.multi_block_phase_finish(MultiBlockPhase::StatusClear, phase_start);
 
         let xfer = xfer.unwrap();
 
@@ -1165,39 +1979,99 @@ impl SdMmc {
             DataXfer::Write(buf) => buf.len(),
         };
 
+        assert!(buf_len != 0, "IDMAC transfer buffer must not be empty");
         assert!(
-            buf_len <= 0x1fff,
-            "IDMAC single descriptor buffer too large: {buf_len}"
+            buf_len <= DMA_BUFFER_SIZE,
+            "IDMAC transfer exceeds the DMA bounce buffer: {buf_len}"
         );
 
-        // One descriptor covers the contiguous single-block buffer.
-        let layout = Layout::new::<IdmacDescriptor>();
+        let descriptor_count = buf_len.div_ceil(IDMAC_DESCRIPTOR_BUFFER_SIZE);
+        let layout = Layout::array::<IdmacDescriptor>(descriptor_count)
+            .expect("Invalid IDMAC descriptor chain layout");
+        #[cfg(feature = "multi-block-test")]
+        let phase_start = self.multi_block_phase_start();
         let dma_desc_info =
             unsafe { alloc_coherent(layout) }.expect("Failed to allocate DMA descriptor");
+        #[cfg(feature = "multi-block-test")]
+        self.multi_block_phase_finish(MultiBlockPhase::DescriptorAlloc, phase_start);
         let desc_ptr = dma_desc_info.cpu_addr.as_ptr() as *mut IdmacDescriptor;
-
-        let mut descriptor = IdmacDescriptor::new();
-        descriptor.set_desc0_control_descriptor(true, false, false, false, true, true, false);
-        descriptor.set_des1_buffer1_size(buf_len as u16);
-        descriptor.set_des2_buffer1_address(dma_bus_addr);
-        descriptor.set_des3_next_descriptor_address(0);
-        unsafe { core::ptr::write_volatile(desc_ptr, descriptor) };
-
         let desc_phy_addr = u32::try_from(dma_desc_info.bus_addr.as_u64())
             .expect("DMA descriptor address exceeds the IDMAC 32-bit address range");
+
+        #[cfg(feature = "multi-block-test")]
+        let phase_start = self.multi_block_phase_start();
+        for index in 0..descriptor_count {
+            let offset = index * IDMAC_DESCRIPTOR_BUFFER_SIZE;
+            let segment_len = (buf_len - offset).min(IDMAC_DESCRIPTOR_BUFFER_SIZE);
+            let last = index + 1 == descriptor_count;
+            let buffer_addr = dma_bus_addr
+                .checked_add(offset as u32)
+                .expect("DMA data buffer crosses the IDMAC 32-bit address boundary");
+            let next_descriptor_addr = if last {
+                0
+            } else {
+                desc_phy_addr
+                    .checked_add(((index + 1) * core::mem::size_of::<IdmacDescriptor>()) as u32)
+                    .expect("DMA descriptor chain crosses the IDMAC 32-bit address boundary")
+            };
+
+            let mut descriptor = IdmacDescriptor::new();
+            descriptor.set_desc0_control_descriptor(
+                true,
+                false,
+                false,
+                !last,
+                index == 0,
+                last,
+                !last,
+            );
+            descriptor.set_des1_buffer1_size(segment_len as u16);
+            descriptor.set_des2_buffer1_address(buffer_addr);
+            descriptor.set_des3_next_descriptor_address(next_descriptor_addr);
+            unsafe { core::ptr::write_volatile(desc_ptr.add(index), descriptor) };
+        }
+
         dma_io_fence();
         self.regs.bytcnt().write(buf_len as u32);
         self.regs.dbaddr().write(desc_phy_addr);
         dma_io_fence();
+        #[cfg(feature = "multi-block-test")]
+        self.multi_block_phase_finish(MultiBlockPhase::DescriptorPublish, phase_start);
 
-        Some(IdmacTransferContext {
+        let context = IdmacTransferContext {
             cmd,
             arg,
             generation: 0,
             dma_desc_info,
             layout,
             desc_ptr,
-        })
+            descriptor_count,
+        };
+        let programmed_dbaddr = self.regs.dbaddr().read();
+        let programmed_byte_count = self.regs.bytcnt().read();
+        let owned_descriptors = Self::descriptor_owned_count(&context);
+        if programmed_dbaddr != desc_phy_addr
+            || programmed_byte_count != buf_len as u32
+            || owned_descriptors != descriptor_count
+        {
+            warn!(
+                "IDMAC descriptor publication failed before cmd={}: expected_DBADDR=0x{:08x}, \
+                 actual_DBADDR=0x{:08x}, expected_BYTCNT={}, actual_BYTCNT={}, expected_OWN={}, \
+                 actual_OWN={}",
+                cmd.cmd_index(),
+                desc_phy_addr,
+                programmed_dbaddr,
+                buf_len,
+                programmed_byte_count,
+                descriptor_count,
+                owned_descriptors,
+            );
+            self.idmac_faulted = true;
+            let _ = self.finish_idmac_transfer(context, true);
+            return None;
+        }
+
+        Some(context)
     }
 
     fn start_idmac_transfer(
@@ -1207,11 +2081,17 @@ impl SdMmc {
         let cmd = context.cmd;
         context.generation = IDMAC_COMPLETION.begin_transfer();
 
+        #[cfg(feature = "multi-block-test")]
+        let phase_start = self.multi_block_phase_start();
         self.regs.cmdarg().write(context.arg);
         dma_io_fence();
         self.regs.cmd().write(cmd);
         dma_io_fence();
+        #[cfg(feature = "multi-block-test")]
+        self.multi_block_phase_finish(MultiBlockPhase::CommandIssue, phase_start);
 
+        #[cfg(feature = "multi-block-test")]
+        let phase_start = self.multi_block_phase_start();
         let mut start_cmd_wait_count = 0u64;
         let start_cmd_deadline = axhal::time::monotonic_time() + Duration::from_millis(100);
         while self.regs.cmd().read().start_cmd() {
@@ -1237,7 +2117,11 @@ impl SdMmc {
                 return None;
             }
         }
+        #[cfg(feature = "multi-block-test")]
+        self.multi_block_phase_finish(MultiBlockPhase::CommandAccept, phase_start);
 
+        #[cfg(feature = "multi-block-test")]
+        let phase_start = self.multi_block_phase_start();
         let idsts_before_pldmnd = self.regs.idsts().read();
         if idsts_before_pldmnd.du() {
             warn!(
@@ -1284,6 +2168,8 @@ impl SdMmc {
                 dbaddr,
             );
         }
+        #[cfg(feature = "multi-block-test")]
+        self.multi_block_phase_finish(MultiBlockPhase::PostStartChecks, phase_start);
 
         Some(context)
     }
@@ -1323,25 +2209,43 @@ impl SdMmc {
         }
 
         let command_done = !context.cmd.response_expect() || rintsts.command_done();
+        let auto_stop_done = !context.cmd.send_auto_stop() || rintsts.auto_command_done();
         let dma_done = if context.cmd.read_write() {
             idsts.ti()
         } else {
             idsts.ri()
         };
-        command_done && dma_done && rintsts.data_transfer_over()
+        command_done && auto_stop_done && dma_done && rintsts.data_transfer_over()
+    }
+
+    fn descriptor_owned_count(context: &IdmacTransferContext) -> usize {
+        (0..context.descriptor_count)
+            .filter(|&index| {
+                let descriptor = unsafe { context.desc_ptr.add(index) };
+                let des0 =
+                    unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*descriptor).des0)) };
+                des0.own()
+            })
+            .count()
     }
 
     fn descriptor_owned(context: &IdmacTransferContext) -> bool {
-        let des0 = unsafe {
-            core::ptr::read_volatile(core::ptr::addr_of!((*context.desc_ptr).des0))
-        };
-        des0.own()
+        Self::descriptor_owned_count(context) != 0
+    }
+
+    fn descriptor_card_error(context: &IdmacTransferContext) -> bool {
+        (0..context.descriptor_count).any(|index| {
+            let descriptor = unsafe { context.desc_ptr.add(index) };
+            let des0 = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*descriptor).des0)) };
+            des0.ces()
+        })
     }
 
     fn validate_idmac_terminal(&self, context: &IdmacTransferContext) -> bool {
         let (rintsts, idsts) = self.idmac_completion_status(context.generation);
         let has_error = Self::idmac_status_has_error(&rintsts, &idsts);
         let command_done = !context.cmd.response_expect() || rintsts.command_done();
+        let auto_stop_done = !context.cmd.send_auto_stop() || rintsts.auto_command_done();
         let dma_done = if context.cmd.read_write() {
             idsts.ti()
         } else {
@@ -1351,49 +2255,106 @@ impl SdMmc {
 
         dma_io_fence();
         let descriptor_owned = Self::descriptor_owned(context);
+        let descriptor_card_error = Self::descriptor_card_error(context);
         let complete = !has_error
             && command_done
+            && auto_stop_done
             && dma_done
             && controller_done
-            && !descriptor_owned;
+            && !descriptor_owned
+            && !descriptor_card_error;
 
         if !complete {
             warn!(
-                "IDMAC terminal validation failed: cmd={}, RINTSTS={rintsts:?}, \
-                 IDSTS={idsts:?}, command_done={command_done}, dma_done={dma_done}, \
-                 controller_done={controller_done}, desc_own={descriptor_owned}",
+                "IDMAC terminal validation failed: cmd={}, RINTSTS={rintsts:?}, IDSTS={idsts:?}, \
+                 command_done={command_done}, auto_stop_done={auto_stop_done}, \
+                 dma_done={dma_done}, controller_done={controller_done}, \
+                 desc_own={descriptor_owned}, desc_ces={descriptor_card_error}, descriptors={}",
                 context.cmd.cmd_index(),
+                context.descriptor_count,
             );
         }
 
         complete
     }
 
-    fn wait_transfer_sync(
-        &self,
-        context: &IdmacTransferContext,
-    ) -> Result<(), IdmacWaitError> {
+    fn wait_transfer_sync(&mut self, context: &IdmacTransferContext) -> Result<(), IdmacWaitError> {
+        #[cfg(feature = "multi-block-test")]
+        let phase_start = self.multi_block_phase_start();
         if context.cmd.response_expect() {
             let deadline = axhal::time::wall_time() + Duration::from_secs(2);
             while !self.idmac_command_done_or_error(context) {
                 if axhal::time::wall_time() >= deadline {
+                    #[cfg(feature = "multi-block-test")]
+                    self.multi_block_phase_finish(MultiBlockPhase::CommandResponse, phase_start);
                     return Err(IdmacWaitError::CommandTimeout);
                 }
                 core::hint::spin_loop();
             }
         }
+        #[cfg(feature = "multi-block-test")]
+        self.multi_block_phase_finish(MultiBlockPhase::CommandResponse, phase_start);
 
         let (rintsts, idsts) = self.idmac_completion_status(context.generation);
         if Self::idmac_status_has_error(&rintsts, &idsts) {
             return Err(IdmacWaitError::Hardware);
         }
 
+        #[cfg(feature = "multi-block-test")]
+        let data_phase_start = self.multi_block_phase_start();
+        #[cfg(feature = "multi-block-test")]
+        let mut data_done_ns = None;
         let deadline = axhal::time::wall_time() + Duration::from_secs(5);
-        while !self.idmac_terminal_events_or_error(context) {
+        loop {
+            let terminal = self.idmac_terminal_events_or_error(context);
+            #[cfg(feature = "multi-block-test")]
+            if data_phase_start.is_some() && data_done_ns.is_none() {
+                let (rintsts, idsts) = self.idmac_completion_status(context.generation);
+                let dma_done = if context.cmd.read_write() {
+                    idsts.ti()
+                } else {
+                    idsts.ri()
+                };
+                if dma_done && rintsts.data_transfer_over() {
+                    data_done_ns = Some(axhal::time::monotonic_time_nanos());
+                }
+            }
+            if terminal {
+                break;
+            }
             if axhal::time::wall_time() >= deadline {
+                #[cfg(feature = "multi-block-test")]
+                {
+                    let terminal_ns = axhal::time::monotonic_time_nanos();
+                    let started_ns = data_phase_start.unwrap_or(terminal_ns);
+                    self.multi_block_profiler.add(
+                        MultiBlockPhase::DataTransfer,
+                        data_done_ns
+                            .unwrap_or(terminal_ns)
+                            .saturating_sub(started_ns),
+                    );
+                    self.multi_block_profiler.add(
+                        MultiBlockPhase::AutoStopTail,
+                        terminal_ns.saturating_sub(data_done_ns.unwrap_or(terminal_ns)),
+                    );
+                }
                 return Err(IdmacWaitError::DataTimeout);
             }
             core::hint::spin_loop();
+        }
+        #[cfg(feature = "multi-block-test")]
+        {
+            let terminal_ns = axhal::time::monotonic_time_nanos();
+            let started_ns = data_phase_start.unwrap_or(terminal_ns);
+            let data_done_ns = data_done_ns.unwrap_or(terminal_ns);
+            self.multi_block_profiler.add(
+                MultiBlockPhase::DataTransfer,
+                data_done_ns.saturating_sub(started_ns),
+            );
+            self.multi_block_profiler.add(
+                MultiBlockPhase::AutoStopTail,
+                terminal_ns.saturating_sub(data_done_ns),
+            );
         }
 
         let (rintsts, idsts) = self.idmac_completion_status(context.generation);
@@ -1543,6 +2504,7 @@ impl SdMmc {
             let idmac_error =
                 idsts.ais() || idsts.ces() || idsts.du() || idsts.fbe() || rintsts.error();
             let transfer_done = idsts.ri() || idsts.ti() || rintsts.data_transfer_over();
+            let transfer_event = transfer_done || rintsts.auto_command_done();
 
             if idmac_error {
                 IDMAC_ERROR_FLAG.store(true, Ordering::Release);
@@ -1553,7 +2515,7 @@ impl SdMmc {
                 regs.idsts().write(idsts);
             }
 
-            if transfer_done
+            if transfer_event
                 || idmac_error
                 || rintsts.receive_fifo_data_request()
                 || rintsts.transmit_fifo_data_request()
@@ -1561,6 +2523,7 @@ impl SdMmc {
                 let mut clear_rintsts = crate::regs::RIntSts::new();
                 clear_rintsts = clear_rintsts
                     .with_end_bit_error(rintsts.end_bit_error())
+                    .with_auto_command_done(rintsts.auto_command_done())
                     .with_start_bit_error(rintsts.start_bit_error())
                     .with_hardware_locked_write(rintsts.hardware_locked_write())
                     .with_fifo_under_over_run(rintsts.fifo_under_over_run())
@@ -1577,7 +2540,7 @@ impl SdMmc {
             }
 
             IDMAC_COMPLETION.record_irq(rintsts, idsts);
-            should_notify = transfer_done || idmac_error;
+            should_notify = transfer_event || idmac_error;
 
             if !has_rintsts && !has_idsts {
                 debug!(

@@ -1,6 +1,6 @@
 // Define interfaces for DMA operations using IDMAC（Internal DMA Controller）
 
-// According to Synopsys's DesignWare Cores Mobile Storage Host Controller Databook, 
+// According to Synopsys's DesignWare Cores Mobile Storage Host Controller Databook,
 // the IDMAC of DWC_MSHC supports both Double-Buffer and Chained Descriptor modes.
 // Here we use the Chained Descriptor mode, which allows for more flexible
 // and efficient DMA transfers by linking multiple descriptors together.
@@ -9,10 +9,9 @@
 // VisionFive2, the DWC_MSHC is configured to operate in 32-bit addressing mode,
 // so the descriptors and buffer addresses are 32-bit values.
 
+pub use axdma::{DMAInfo, alloc_coherent, dealloc_coherent};
 use bitfield_struct::bitfield;
 use log::trace;
-
-pub use axdma::{alloc_coherent, dealloc_coherent, DMAInfo};
 
 // DMA buffer information, including both the CPU virtual address and the physical address for DMA.
 pub struct DMABuffer {
@@ -42,7 +41,7 @@ pub struct IdmacDescriptor {
     /// dual-buffer structure is used. If the Second Address Chained (DES0[4])
     /// bit is set, then this address contains the pointer to the physical memory
     /// where the Next Descriptor is present.
-    /// 
+    ///
     /// If this is not the last descriptor, then the Next Descriptor address pointer
     /// must be bus-width aligned (DES3[2/1/0:0] = 0 corresponding to buswidth of 64/32/16,
     /// internally the LSBs are ignored).
@@ -57,7 +56,7 @@ pub struct IdmacDes0 {
     /// When this bit is reset, it indicates that the descriptor is owned by the Host.
     /// The IDMAC clears this bit when it completes the data transfer.
     pub own: bool,
-    
+
     /// Card Error Summary (CES) bit (bit 30)
     /// These error bits indicate the status of the transaction to or from the card.
     /// These bits are also present in RINTSTS
@@ -70,11 +69,11 @@ pub struct IdmacDes0 {
     ///     • DCRC: Data CRC for Receive
     ///     • RE: Response Error
     pub ces: bool,
-    
+
     /// Reserved bits (bits 29-6)
     #[bits(24)]
     pub _reserved1: u32,
-    
+
     /// End of Ring (ER) bit (bit 5)
     /// When set, this bit indicates that the descriptor list reached its final
     /// descriptor. The IDMAC returns to the base address of the list, creating a
@@ -116,7 +115,7 @@ pub struct IdmacDes1 {
     #[bits(19)]
     pub _reserved: u32,
 
-    /// Not defined in chained descriptor mode. Included in reserved bits. 
+    /// Not defined in chained descriptor mode. Included in reserved bits.
     /// Buffer 2 Size (BS2) (bits 25-13)
     /// This field is not valid if DES0[4] is set, and all its bits should be set to 0.
     /// These bits indicate the second data buffer byte size. The buffer size must
@@ -149,13 +148,29 @@ impl IdmacDescriptor {
     }
 
     /// Sets the control bits for the DMA transfer in des0.
-    pub fn set_desc0_control_descriptor(&mut self, own: bool, ces: bool, er: bool, ch: bool, fs: bool, ld: bool, dic: bool) {
+    pub fn set_desc0_control_descriptor(
+        &mut self,
+        own: bool,
+        ces: bool,
+        er: bool,
+        ch: bool,
+        fs: bool,
+        ld: bool,
+        dic: bool,
+    ) {
         trace!(
             "Setting control descriptor:\nown={}, ces={}, er={}, ch={}, fs={}, ld={}, dic={}",
             own, ces, er, ch, fs, ld, dic
         );
 
-        self.des0 = IdmacDes0::new().with_own(own).with_ces(ces).with_er(er).with_ch(ch).with_fs(fs).with_ld(ld).with_dic(dic);
+        self.des0 = IdmacDes0::new()
+            .with_own(own)
+            .with_ces(ces)
+            .with_er(er)
+            .with_ch(ch)
+            .with_fs(fs)
+            .with_ld(ld)
+            .with_dic(dic);
     }
 
     /// Sets the size of the data buffer for the DMA transfer in des1.
@@ -179,5 +194,3 @@ impl IdmacDescriptor {
         self.des3 = addr;
     }
 }
-
-// TODO: support descriptor ring to allow multi-block transfers without CPU intervention.

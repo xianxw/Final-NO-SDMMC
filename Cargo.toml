@@ -66,6 +66,11 @@ qemu = [
 smp = ["axfeat/smp", "axplat-riscv64-visionfive2?/smp"]
 
 vf2 = ["dep:axplat-riscv64-visionfive2", "axfeat/driver-sdmmc"]
+multi-block-test = [
+    "vf2",
+    "dep:axdriver",
+    "axdriver/multi-block-test",
+]
 
 [[bin]]
 name = "starryos"
@@ -74,6 +79,10 @@ path = "src/main.rs"
 [dependencies]
 axfeat.workspace = true
 starry-kernel.workspace = true
+
+[dependencies.axdriver]
+workspace = true
+optional = true
 
 [dependencies.axplat-riscv64-visionfive2]
 version = "0.1.0-pre.1"
