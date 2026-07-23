@@ -55,6 +55,16 @@ la:
 	$(MAKE) ARCH=loongarch64 run
 
 vf2:
-	$(MAKE) ARCH=riscv64 APP_FEATURES=vf2 MYPLAT=axplat-riscv64-visionfive2 BUS=mmio build
+	$(MAKE) ARCH=riscv64 APP_FEATURES=vf2 \
+		MYPLAT=axplat-riscv64-visionfive2 BUS=mmio \
+		TARGET_DIR=$(PWD)/target/vf2 build
 
-.PHONY: build run justrun debug disasm clean
+vf2-one-block-test:
+	$(MAKE) ARCH=riscv64 APP_FEATURES=one-block-test \
+		MYPLAT=axplat-riscv64-visionfive2 BUS=mmio \
+		TARGET_DIR=$(PWD)/target/one-block-test build
+	@cp $(PWD)/Final-NO-SDMMC_visionfive2.bin \
+		$(PWD)/Final-NO-SDMMC_visionfive2-one-block-test.bin
+	@echo "one-block test image: $(PWD)/Final-NO-SDMMC_visionfive2-one-block-test.bin"
+
+.PHONY: build run justrun debug disasm clean vf2 vf2-one-block-test

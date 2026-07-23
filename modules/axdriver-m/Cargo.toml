@@ -76,6 +76,7 @@ ixgbe = [
     "dep:axdma",
 ]
 net = ["dep:axdriver_net"]
+one-block-test = ["sdmmc", "axdriver_block/one-block-test"]
 ramdisk = [
     "block",
     "axdriver_block/ramdisk",

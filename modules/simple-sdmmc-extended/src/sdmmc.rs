@@ -5,6 +5,8 @@ use core::{
     time::Duration,
 };
 
+#[cfg(feature = "one-block-test")]
+use alloc::vec;
 use axtask::WaitQueue;
 use log::{debug, info, trace, warn};
 use volatile::VolatilePtr;
@@ -16,10 +18,472 @@ use crate::{
     utils::{Cid, CsdV2},
 };
 
-// VisionFive 2 supplies a 100 MHz CIU clock to SDIO1. DW-MMC divides it by 2*n.
+// Existing production assumption. The diagnostic build uses the measured JH7110 clock tree.
+#[cfg(not(feature = "one-block-test"))]
 const VISIONFIVE2_SDIO_CIU_CLOCK_HZ: u32 = 100_000_000;
+#[cfg(feature = "one-block-test")]
+const VISIONFIVE2_SDIO_CIU_CLOCK_HZ: u32 = 49_500_000;
 const IDENTIFICATION_CLOCK_DIVIDER: u8 = 100;
+#[cfg(not(feature = "one-block-test"))]
 const DEFAULT_SPEED_CLOCK_DIVIDER: u8 = 2;
+#[cfg(feature = "one-block-test")]
+const DEFAULT_SPEED_CLOCK_DIVIDER: u8 = 1;
+
+#[cfg(feature = "one-block-test")]
+const ONE_BLOCK_TEST_START_LBA: u32 = 2_099_200;
+#[cfg(feature = "one-block-test")]
+const ONE_BLOCK_TEST_BLOCKS: usize = 256;
+#[cfg(feature = "one-block-test")]
+const ONE_BLOCK_TEST_ROUNDS: usize = 5;
+#[cfg(feature = "one-block-test")]
+const ONE_BLOCK_TIMER_SAMPLES: usize = 4_096;
+#[cfg(feature = "one-block-test")]
+const ONE_BLOCK_TRANSFER_BYTES: u32 = 512;
+
+#[cfg(feature = "one-block-test")]
+const JH7110_SYSCRG_BASE_PADDR: usize = 0x1302_0000;
+#[cfg(feature = "one-block-test")]
+const JH7110_SYS_SYSCON_BASE_PADDR: usize = 0x1303_0000;
+#[cfg(feature = "one-block-test")]
+const JH7110_OSC_CLOCK_HZ: u64 = 24_000_000;
+#[cfg(feature = "one-block-test")]
+const JH7110_SYSCLK_BUS_ROOT: usize = 5;
+#[cfg(feature = "one-block-test")]
+const JH7110_SYSCLK_AXI_CFG0: usize = 7;
+#[cfg(feature = "one-block-test")]
+const JH7110_SYSCLK_SDIO1_SDCARD: usize = 94;
+
+#[cfg(feature = "one-block-test")]
+#[derive(Clone, Copy)]
+enum OneBlockOperation {
+    Read,
+    Write,
+}
+
+#[cfg(feature = "one-block-test")]
+impl OneBlockOperation {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+        }
+    }
+}
+
+#[cfg(feature = "one-block-test")]
+#[derive(Clone, Copy)]
+#[repr(usize)]
+enum OneBlockPhase {
+    Total,
+    TransactionConfig,
+    BounceCopy,
+    IdleWait,
+    StatusClear,
+    DescriptorAlloc,
+    DescriptorPublish,
+    CommandIssue,
+    CommandAccept,
+    PostStartChecks,
+    CommandResponse,
+    DataTransfer,
+    TerminalValidate,
+    FinishCleanup,
+    CardBusy,
+    Unaccounted,
+}
+
+#[cfg(feature = "one-block-test")]
+impl OneBlockPhase {
+    const COUNT: usize = 16;
+    const ALL: [Self; Self::COUNT] = [
+        Self::Total,
+        Self::TransactionConfig,
+        Self::BounceCopy,
+        Self::IdleWait,
+        Self::StatusClear,
+        Self::DescriptorAlloc,
+        Self::DescriptorPublish,
+        Self::CommandIssue,
+        Self::CommandAccept,
+        Self::PostStartChecks,
+        Self::CommandResponse,
+        Self::DataTransfer,
+        Self::TerminalValidate,
+        Self::FinishCleanup,
+        Self::CardBusy,
+        Self::Unaccounted,
+    ];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Total => "total",
+            Self::TransactionConfig => "transaction_config",
+            Self::BounceCopy => "bounce_copy",
+            Self::IdleWait => "previous_idle_wait",
+            Self::StatusClear => "status_clear",
+            Self::DescriptorAlloc => "descriptor_alloc",
+            Self::DescriptorPublish => "descriptor_publish",
+            Self::CommandIssue => "command_issue",
+            Self::CommandAccept => "command_accept",
+            Self::PostStartChecks => "post_start_checks",
+            Self::CommandResponse => "command_response",
+            Self::DataTransfer => "data_transfer",
+            Self::TerminalValidate => "terminal_validate",
+            Self::FinishCleanup => "finish_cleanup",
+            Self::CardBusy => "card_busy",
+            Self::Unaccounted => "unaccounted",
+        }
+    }
+}
+
+#[cfg(feature = "one-block-test")]
+#[derive(Clone, Copy)]
+struct OneBlockPhaseStats {
+    count: u64,
+    total_ns: u64,
+    min_ns: u64,
+    max_ns: u64,
+}
+
+#[cfg(feature = "one-block-test")]
+impl OneBlockPhaseStats {
+    const fn new() -> Self {
+        Self {
+            count: 0,
+            total_ns: 0,
+            min_ns: u64::MAX,
+            max_ns: 0,
+        }
+    }
+
+    fn record(&mut self, duration_ns: u64) {
+        self.count = self.count.saturating_add(1);
+        self.total_ns = self.total_ns.saturating_add(duration_ns);
+        self.min_ns = self.min_ns.min(duration_ns);
+        self.max_ns = self.max_ns.max(duration_ns);
+    }
+
+    fn merge(&mut self, other: Self) {
+        if other.count == 0 {
+            return;
+        }
+        self.count = self.count.saturating_add(other.count);
+        self.total_ns = self.total_ns.saturating_add(other.total_ns);
+        self.min_ns = self.min_ns.min(other.min_ns);
+        self.max_ns = self.max_ns.max(other.max_ns);
+    }
+
+    fn average_ns(self) -> u64 {
+        if self.count == 0 {
+            0
+        } else {
+            self.total_ns / self.count
+        }
+    }
+}
+
+#[cfg(feature = "one-block-test")]
+#[derive(Clone, Copy)]
+struct OneBlockTcbcntSample {
+    in_transfer_readable: bool,
+    response_start_ns: u64,
+    initial_count: u32,
+    first_nonzero_count: Option<u32>,
+    first_nonzero_ns: Option<u64>,
+    reached_block_count: Option<u32>,
+    reached_block_ns: Option<u64>,
+    terminal_count: u32,
+    poll_count: u64,
+    transition_count: u64,
+    max_step_bytes: u32,
+}
+
+#[cfg(feature = "one-block-test")]
+impl OneBlockTcbcntSample {
+    fn new(
+        in_transfer_readable: bool,
+        response_start_ns: u64,
+        initial_observed_ns: u64,
+        initial_count: u32,
+    ) -> Self {
+        let mut sample = Self {
+            in_transfer_readable,
+            response_start_ns,
+            initial_count,
+            first_nonzero_count: None,
+            first_nonzero_ns: None,
+            reached_block_count: None,
+            reached_block_ns: None,
+            terminal_count: initial_count,
+            poll_count: 1,
+            transition_count: 0,
+            max_step_bytes: 0,
+        };
+        sample.record_observation(initial_observed_ns, initial_count);
+        sample
+    }
+
+    fn record_observation(&mut self, observed_ns: u64, count: u32) {
+        if count != self.terminal_count {
+            self.transition_count = self.transition_count.saturating_add(1);
+            self.max_step_bytes = self
+                .max_step_bytes
+                .max(count.saturating_sub(self.terminal_count));
+        }
+        if self.first_nonzero_count.is_none() && count != 0 {
+            self.first_nonzero_count = Some(count);
+            self.first_nonzero_ns = Some(observed_ns);
+        }
+        if self.reached_block_count.is_none() && count >= ONE_BLOCK_TRANSFER_BYTES {
+            self.reached_block_count = Some(count);
+            self.reached_block_ns = Some(observed_ns);
+        }
+        self.terminal_count = count;
+    }
+
+    fn observe(&mut self, observed_ns: u64, count: u32) {
+        self.poll_count = self.poll_count.saturating_add(1);
+        self.record_observation(observed_ns, count);
+    }
+}
+
+#[cfg(feature = "one-block-test")]
+#[derive(Clone, Copy)]
+struct OneBlockTcbcntStats {
+    requests: u64,
+    in_transfer_readable_requests: u64,
+    reached_block_requests: u64,
+    slope_samples: u64,
+    all_zero_requests: u64,
+    initial_count: OneBlockPhaseStats,
+    first_nonzero_count: OneBlockPhaseStats,
+    reached_block_count: OneBlockPhaseStats,
+    terminal_count: OneBlockPhaseStats,
+    poll_count: OneBlockPhaseStats,
+    transition_count: OneBlockPhaseStats,
+    max_step_bytes: OneBlockPhaseStats,
+    bus_width_bits: OneBlockPhaseStats,
+    response_to_block_ns: OneBlockPhaseStats,
+    observed_payload_ns: OneBlockPhaseStats,
+    estimated_sdclk_hz: OneBlockPhaseStats,
+}
+
+#[cfg(feature = "one-block-test")]
+impl OneBlockTcbcntStats {
+    const fn new() -> Self {
+        Self {
+            requests: 0,
+            in_transfer_readable_requests: 0,
+            reached_block_requests: 0,
+            slope_samples: 0,
+            all_zero_requests: 0,
+            initial_count: OneBlockPhaseStats::new(),
+            first_nonzero_count: OneBlockPhaseStats::new(),
+            reached_block_count: OneBlockPhaseStats::new(),
+            terminal_count: OneBlockPhaseStats::new(),
+            poll_count: OneBlockPhaseStats::new(),
+            transition_count: OneBlockPhaseStats::new(),
+            max_step_bytes: OneBlockPhaseStats::new(),
+            bus_width_bits: OneBlockPhaseStats::new(),
+            response_to_block_ns: OneBlockPhaseStats::new(),
+            observed_payload_ns: OneBlockPhaseStats::new(),
+            estimated_sdclk_hz: OneBlockPhaseStats::new(),
+        }
+    }
+
+    fn record(&mut self, sample: OneBlockTcbcntSample, bus_width_bits: u64) {
+        self.requests = self.requests.saturating_add(1);
+        if sample.in_transfer_readable {
+            self.in_transfer_readable_requests =
+                self.in_transfer_readable_requests.saturating_add(1);
+        }
+        self.initial_count.record(sample.initial_count as u64);
+        self.terminal_count.record(sample.terminal_count as u64);
+        self.poll_count.record(sample.poll_count);
+        self.transition_count.record(sample.transition_count);
+        self.max_step_bytes.record(sample.max_step_bytes as u64);
+        self.bus_width_bits.record(bus_width_bits);
+
+        let Some(first_count) = sample.first_nonzero_count else {
+            self.all_zero_requests = self.all_zero_requests.saturating_add(1);
+            return;
+        };
+        self.first_nonzero_count.record(first_count as u64);
+
+        let (Some(first_ns), Some(reached_count), Some(reached_ns)) = (
+            sample.first_nonzero_ns,
+            sample.reached_block_count,
+            sample.reached_block_ns,
+        ) else {
+            return;
+        };
+        self.reached_block_requests = self.reached_block_requests.saturating_add(1);
+        self.reached_block_count.record(reached_count as u64);
+        self.response_to_block_ns
+            .record(reached_ns.saturating_sub(sample.response_start_ns));
+
+        let elapsed_ns = reached_ns.saturating_sub(first_ns);
+        let transferred_bytes = reached_count.saturating_sub(first_count) as u64;
+        if !sample.in_transfer_readable
+            || elapsed_ns == 0
+            || transferred_bytes == 0
+            || bus_width_bits == 0
+        {
+            return;
+        }
+
+        self.slope_samples = self.slope_samples.saturating_add(1);
+        self.observed_payload_ns.record(elapsed_ns);
+        let sdclk_hz = ((transferred_bytes as u128 * 8 * 1_000_000_000u128)
+            / (elapsed_ns as u128 * bus_width_bits as u128))
+            .min(u64::MAX as u128) as u64;
+        self.estimated_sdclk_hz.record(sdclk_hz);
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.requests = self.requests.saturating_add(other.requests);
+        self.in_transfer_readable_requests = self
+            .in_transfer_readable_requests
+            .saturating_add(other.in_transfer_readable_requests);
+        self.reached_block_requests = self
+            .reached_block_requests
+            .saturating_add(other.reached_block_requests);
+        self.slope_samples = self.slope_samples.saturating_add(other.slope_samples);
+        self.all_zero_requests = self
+            .all_zero_requests
+            .saturating_add(other.all_zero_requests);
+        self.initial_count.merge(other.initial_count);
+        self.first_nonzero_count.merge(other.first_nonzero_count);
+        self.reached_block_count.merge(other.reached_block_count);
+        self.terminal_count.merge(other.terminal_count);
+        self.poll_count.merge(other.poll_count);
+        self.transition_count.merge(other.transition_count);
+        self.max_step_bytes.merge(other.max_step_bytes);
+        self.bus_width_bits.merge(other.bus_width_bits);
+        self.response_to_block_ns
+            .merge(other.response_to_block_ns);
+        self.observed_payload_ns.merge(other.observed_payload_ns);
+        self.estimated_sdclk_hz
+            .merge(other.estimated_sdclk_hz);
+    }
+}
+
+#[cfg(feature = "one-block-test")]
+#[derive(Clone, Copy)]
+struct OneBlockProfileStats {
+    phases: [OneBlockPhaseStats; OneBlockPhase::COUNT],
+    tcbcnt: OneBlockTcbcntStats,
+}
+
+#[cfg(feature = "one-block-test")]
+impl OneBlockProfileStats {
+    const fn new() -> Self {
+        Self {
+            phases: [OneBlockPhaseStats::new(); OneBlockPhase::COUNT],
+            tcbcnt: OneBlockTcbcntStats::new(),
+        }
+    }
+
+    fn record(&mut self, sample: &[u64; OneBlockPhase::COUNT]) {
+        for phase in OneBlockPhase::ALL {
+            self.phases[phase as usize].record(sample[phase as usize]);
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        for phase in OneBlockPhase::ALL {
+            self.phases[phase as usize].merge(other.phases[phase as usize]);
+        }
+        self.tcbcnt.merge(other.tcbcnt);
+    }
+}
+
+#[cfg(feature = "one-block-test")]
+struct OneBlockProfiler {
+    enabled: bool,
+    operation: OneBlockOperation,
+    request_start_ns: u64,
+    current: [u64; OneBlockPhase::COUNT],
+    read: OneBlockProfileStats,
+    write: OneBlockProfileStats,
+}
+
+#[cfg(feature = "one-block-test")]
+impl OneBlockProfiler {
+    const fn new() -> Self {
+        Self {
+            enabled: false,
+            operation: OneBlockOperation::Read,
+            request_start_ns: 0,
+            current: [0; OneBlockPhase::COUNT],
+            read: OneBlockProfileStats::new(),
+            write: OneBlockProfileStats::new(),
+        }
+    }
+
+    fn begin(&mut self, operation: OneBlockOperation) {
+        if !self.enabled {
+            return;
+        }
+        self.operation = operation;
+        self.current.fill(0);
+        self.request_start_ns = axhal::time::monotonic_time_nanos();
+    }
+
+    fn add(&mut self, phase: OneBlockPhase, duration_ns: u64) {
+        if self.enabled {
+            let value = &mut self.current[phase as usize];
+            *value = value.saturating_add(duration_ns);
+        }
+    }
+
+    fn record_tcbcnt(&mut self, sample: OneBlockTcbcntSample, bus_width_bits: u64) {
+        if self.enabled {
+            self.write.tcbcnt.record(sample, bus_width_bits);
+        }
+    }
+
+    fn finish(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        let total_ns = axhal::time::monotonic_time_nanos()
+            .saturating_sub(self.request_start_ns)
+            .max(1);
+        self.current[OneBlockPhase::Total as usize] = total_ns;
+
+        let accounted_ns = OneBlockPhase::ALL
+            .iter()
+            .copied()
+            .filter(|phase| {
+                !matches!(phase, OneBlockPhase::Total | OneBlockPhase::Unaccounted)
+            })
+            .map(|phase| self.current[phase as usize] as u128)
+            .sum::<u128>();
+        self.current[OneBlockPhase::Unaccounted as usize] =
+            total_ns.saturating_sub(accounted_ns.min(u64::MAX as u128) as u64);
+
+        match self.operation {
+            OneBlockOperation::Read => self.read.record(&self.current),
+            OneBlockOperation::Write => self.write.record(&self.current),
+        }
+    }
+
+    fn take(&mut self, operation: OneBlockOperation) -> OneBlockProfileStats {
+        match operation {
+            OneBlockOperation::Read => {
+                let stats = self.read;
+                self.read = OneBlockProfileStats::new();
+                stats
+            }
+            OneBlockOperation::Write => {
+                let stats = self.write;
+                self.write = OneBlockProfileStats::new();
+                stats
+            }
+        }
+    }
+}
 
 fn wait_until<F>(mut f: F)
 where
@@ -158,6 +622,9 @@ pub struct SdMmc {
 
     /// The DMA buffer must be retained if hardware could not be stopped.
     idmac_reset_failed: bool,
+
+    #[cfg(feature = "one-block-test")]
+    one_block_profiler: OneBlockProfiler,
 }
 
 struct ActiveIdmacTransfer<'a> {
@@ -177,16 +644,24 @@ impl<'a> ActiveIdmacTransfer<'a> {
         self.context.as_ref().unwrap()
     }
 
-    fn wait_sync(&self) -> Result<(), IdmacWaitError> {
-        self.sdmmc.wait_transfer_sync(self.context())
+    fn wait_sync(&mut self) -> Result<(), IdmacWaitError> {
+        let context = self.context.as_ref().unwrap();
+        self.sdmmc.wait_transfer_sync(context)
     }
 
     async fn wait_async(&self) -> Result<(), IdmacWaitError> {
         self.sdmmc.wait_transfer_async(self.context()).await
     }
 
-    fn validate(&self) -> bool {
-        self.sdmmc.validate_idmac_terminal(self.context())
+    fn validate(&mut self) -> bool {
+        #[cfg(feature = "one-block-test")]
+        let phase_start = self.sdmmc.one_block_phase_start();
+        let context = self.context.as_ref().unwrap();
+        let complete = self.sdmmc.validate_idmac_terminal(context);
+        #[cfg(feature = "one-block-test")]
+        self.sdmmc
+            .one_block_phase_finish(OneBlockPhase::TerminalValidate, phase_start);
+        complete
     }
 
     fn response(&self) -> [u32; 4] {
@@ -199,7 +674,13 @@ impl<'a> ActiveIdmacTransfer<'a> {
 
     fn finish(mut self, recover: bool) -> bool {
         let context = self.context.take().unwrap();
-        self.sdmmc.finish_idmac_transfer(context, recover)
+        #[cfg(feature = "one-block-test")]
+        let phase_start = self.sdmmc.one_block_phase_start();
+        let complete = self.sdmmc.finish_idmac_transfer(context, recover);
+        #[cfg(feature = "one-block-test")]
+        self.sdmmc
+            .one_block_phase_finish(OneBlockPhase::FinishCleanup, phase_start);
+        complete
     }
 }
 
@@ -236,11 +717,611 @@ impl SdMmc {
             dma_buffer: None,
             idmac_faulted: false,
             idmac_reset_failed: false,
+            #[cfg(feature = "one-block-test")]
+            one_block_profiler: OneBlockProfiler::new(),
         };
         this.init();
         this.try_enable_idmac(512, AHBDataWidth::Bits32, register_irq);
 
+        #[cfg(feature = "one-block-test")]
+        this.run_one_block_test();
+
         this
+    }
+
+    #[cfg(feature = "one-block-test")]
+    fn one_block_phase_start(&self) -> Option<u64> {
+        self.one_block_profiler
+            .enabled
+            .then(axhal::time::monotonic_time_nanos)
+    }
+
+    #[cfg(feature = "one-block-test")]
+    fn one_block_phase_finish(&mut self, phase: OneBlockPhase, started_ns: Option<u64>) {
+        if let Some(started_ns) = started_ns {
+            self.one_block_profiler.add(
+                phase,
+                axhal::time::monotonic_time_nanos().saturating_sub(started_ns),
+            );
+        }
+    }
+
+    #[cfg(feature = "one-block-test")]
+    fn one_block_wait_card_idle(&mut self) {
+        if !self.one_block_profiler.enabled {
+            return;
+        }
+
+        let phase_start = self.one_block_phase_start();
+        let deadline = axhal::time::monotonic_time() + Duration::from_secs(1);
+        while !self.can_send_data() {
+            if axhal::time::monotonic_time() >= deadline {
+                self.one_block_phase_finish(OneBlockPhase::CardBusy, phase_start);
+                self.idmac_faulted = true;
+                panic!("one-block-test: card stayed busy for more than one second after CMD24");
+            }
+            core::hint::spin_loop();
+        }
+        self.one_block_phase_finish(OneBlockPhase::CardBusy, phase_start);
+    }
+
+    #[cfg(feature = "one-block-test")]
+    fn one_block_mib_per_sec_milli(bytes: u64, elapsed_ns: u64) -> u64 {
+        if elapsed_ns == 0 {
+            return 0;
+        }
+        ((bytes as u128 * 1_000_000_000u128 * 1_000u128)
+            / (elapsed_ns as u128 * 1_048_576u128))
+            .min(u64::MAX as u128) as u64
+    }
+
+    #[cfg(feature = "one-block-test")]
+    fn one_block_print_round(
+        operation: OneBlockOperation,
+        round: usize,
+        stats: OneBlockProfileStats,
+        validation_ok: bool,
+    ) {
+        let total = stats.phases[OneBlockPhase::Total as usize];
+        let bytes = total.count.saturating_mul(Self::BLOCK_SIZE as u64);
+        let throughput = Self::one_block_mib_per_sec_milli(bytes, total.total_ns);
+        warn!(
+            "ONE_BLOCK_ROUND operation={} round={} requests={} bytes={} elapsed_ns={} \
+             average_request_ns={} throughput_mib_s={}.{:03} validation={}",
+            operation.name(),
+            round,
+            total.count,
+            bytes,
+            total.total_ns,
+            total.average_ns(),
+            throughput / 1_000,
+            throughput % 1_000,
+            if validation_ok { "ok" } else { "failed" },
+        );
+    }
+
+    #[cfg(feature = "one-block-test")]
+    fn one_block_print_profile(operation: OneBlockOperation, stats: OneBlockProfileStats) {
+        let request_total_ns = stats.phases[OneBlockPhase::Total as usize].total_ns;
+        for phase in OneBlockPhase::ALL {
+            let phase_stats = stats.phases[phase as usize];
+            let percentage_x100 = if request_total_ns == 0 {
+                0
+            } else {
+                ((phase_stats.total_ns as u128 * 10_000u128) / request_total_ns as u128)
+                    .min(u64::MAX as u128) as u64
+            };
+            let min_ns = if phase_stats.count == 0 {
+                0
+            } else {
+                phase_stats.min_ns
+            };
+            warn!(
+                "ONE_BLOCK_PHASE operation={} phase={} count={} total_ns={} average_ns={} \
+                 min_ns={} max_ns={} request_total_percent={}.{:02}",
+                operation.name(),
+                phase.name(),
+                phase_stats.count,
+                phase_stats.total_ns,
+                phase_stats.average_ns(),
+                min_ns,
+                phase_stats.max_ns,
+                percentage_x100 / 100,
+                percentage_x100 % 100,
+            );
+        }
+
+        if matches!(operation, OneBlockOperation::Write) {
+            Self::one_block_print_tcbcnt(stats.tcbcnt);
+        }
+    }
+
+    #[cfg(feature = "one-block-test")]
+    fn one_block_stats_min(stats: OneBlockPhaseStats) -> u64 {
+        if stats.count == 0 { 0 } else { stats.min_ns }
+    }
+
+    #[cfg(feature = "one-block-test")]
+    fn one_block_print_tcbcnt(stats: OneBlockTcbcntStats) {
+        warn!(
+            "ONE_BLOCK_TCBCNT_SUMMARY command=CMD24 requests={} in_transfer_readable={} \
+             reached_512={} slope_samples={} all_zero={} bus_width_bits_avg={} \
+             bus_width_bits_min={} bus_width_bits_max={}",
+            stats.requests,
+            stats.in_transfer_readable_requests,
+            stats.reached_block_requests,
+            stats.slope_samples,
+            stats.all_zero_requests,
+            stats.bus_width_bits.average_ns(),
+            Self::one_block_stats_min(stats.bus_width_bits),
+            stats.bus_width_bits.max_ns,
+        );
+        warn!(
+            "ONE_BLOCK_TCBCNT_COUNTS initial_avg={} initial_min={} initial_max={} \
+             first_nonzero_avg={} first_nonzero_min={} first_nonzero_max={} \
+             reached_avg={} reached_min={} reached_max={} terminal_avg={} \
+             terminal_min={} terminal_max={}",
+            stats.initial_count.average_ns(),
+            Self::one_block_stats_min(stats.initial_count),
+            stats.initial_count.max_ns,
+            stats.first_nonzero_count.average_ns(),
+            Self::one_block_stats_min(stats.first_nonzero_count),
+            stats.first_nonzero_count.max_ns,
+            stats.reached_block_count.average_ns(),
+            Self::one_block_stats_min(stats.reached_block_count),
+            stats.reached_block_count.max_ns,
+            stats.terminal_count.average_ns(),
+            Self::one_block_stats_min(stats.terminal_count),
+            stats.terminal_count.max_ns,
+        );
+        warn!(
+            "ONE_BLOCK_TCBCNT_SAMPLING samples_avg={} samples_min={} samples_max={} \
+             transitions_avg={} transitions_min={} transitions_max={} max_step_bytes_avg={} \
+             max_step_bytes_min={} max_step_bytes_max={}",
+            stats.poll_count.average_ns(),
+            Self::one_block_stats_min(stats.poll_count),
+            stats.poll_count.max_ns,
+            stats.transition_count.average_ns(),
+            Self::one_block_stats_min(stats.transition_count),
+            stats.transition_count.max_ns,
+            stats.max_step_bytes.average_ns(),
+            Self::one_block_stats_min(stats.max_step_bytes),
+            stats.max_step_bytes.max_ns,
+        );
+        warn!(
+            "ONE_BLOCK_TCBCNT_TIMING response_to_512_avg_ns={} response_to_512_min_ns={} \
+             response_to_512_max_ns={} observed_payload_avg_ns={} observed_payload_min_ns={} \
+             observed_payload_max_ns={} estimated_sdclk_avg_hz={} estimated_sdclk_min_hz={} \
+             estimated_sdclk_max_hz={} method=endpoint_slope",
+            stats.response_to_block_ns.average_ns(),
+            Self::one_block_stats_min(stats.response_to_block_ns),
+            stats.response_to_block_ns.max_ns,
+            stats.observed_payload_ns.average_ns(),
+            Self::one_block_stats_min(stats.observed_payload_ns),
+            stats.observed_payload_ns.max_ns,
+            stats.estimated_sdclk_hz.average_ns(),
+            Self::one_block_stats_min(stats.estimated_sdclk_hz),
+            stats.estimated_sdclk_hz.max_ns,
+        );
+    }
+
+    #[cfg(feature = "one-block-test")]
+    fn one_block_bus_width_bits(&self) -> u64 {
+        let ctype = self.regs.ctype().read().into_bits();
+        if ctype & (1 << 16) != 0 {
+            8
+        } else if ctype & 1 != 0 {
+            4
+        } else {
+            1
+        }
+    }
+
+    #[cfg(feature = "one-block-test")]
+    fn one_block_tcbcnt_begin(
+        &self,
+        context: &IdmacTransferContext,
+    ) -> Option<OneBlockTcbcntSample> {
+        if !self.one_block_profiler.enabled || context.cmd.cmd_index() != 24 {
+            return None;
+        }
+
+        let in_transfer_readable = !self.regs.hcon().read().area_opt();
+        let response_start_ns = axhal::time::monotonic_time_nanos();
+        let initial_count = self.regs.tcbcnt().read();
+        let initial_observed_ns = axhal::time::monotonic_time_nanos();
+        Some(OneBlockTcbcntSample::new(
+            in_transfer_readable,
+            response_start_ns,
+            initial_observed_ns,
+            initial_count,
+        ))
+    }
+
+    #[cfg(feature = "one-block-test")]
+    fn one_block_tcbcnt_observe(&self, sample: &mut Option<OneBlockTcbcntSample>) {
+        let Some(sample) = sample.as_mut() else {
+            return;
+        };
+        if !sample.in_transfer_readable || sample.reached_block_ns.is_some() {
+            return;
+        }
+
+        let count = self.regs.tcbcnt().read();
+        let observed_ns = axhal::time::monotonic_time_nanos();
+        sample.observe(observed_ns, count);
+    }
+
+    #[cfg(feature = "one-block-test")]
+    fn one_block_tcbcnt_finish(&mut self, sample: &mut Option<OneBlockTcbcntSample>) {
+        let Some(mut sample) = sample.take() else {
+            return;
+        };
+
+        let terminal_count = self.regs.tcbcnt().read();
+        let terminal_observed_ns = axhal::time::monotonic_time_nanos();
+        sample.observe(terminal_observed_ns, terminal_count);
+        let bus_width_bits = self.one_block_bus_width_bits();
+        self.one_block_profiler
+            .record_tcbcnt(sample, bus_width_bits);
+    }
+
+    #[cfg(feature = "one-block-test")]
+    fn one_block_mmio_read_u32(paddr: usize) -> u32 {
+        let vaddr = axhal::mem::phys_to_virt(paddr.into()).as_usize();
+        // The platform MMIO map contains both SYSCRG and SYS_SYSCON.
+        unsafe { core::ptr::read_volatile(vaddr as *const u32) }
+    }
+
+    #[cfg(feature = "one-block-test")]
+    fn one_block_pll2_rate_hz(cfg0: u32, cfg1: u32, cfg2: u32) -> Option<u64> {
+        let dacpd = (cfg0 >> 15) & 1;
+        let dsmpd = (cfg0 >> 16) & 1;
+        let fbdiv = (cfg0 >> 17) & 0x0fff;
+        let frac = cfg1 & 0x00ff_ffff;
+        let postdiv1 = (cfg1 >> 28) & 0x3;
+        let prediv = cfg2 & 0x3f;
+        if prediv == 0 || dacpd != dsmpd {
+            return None;
+        }
+
+        let effective_frac = if dacpd == 0 { frac } else { 0 };
+        let feedback_x_2_24 = ((fbdiv as u128) << 24) | effective_frac as u128;
+        let denominator = (prediv as u128) * (1u128 << postdiv1) * (1u128 << 24);
+        Some(
+            ((JH7110_OSC_CLOCK_HZ as u128 * feedback_x_2_24) / denominator)
+                .min(u64::MAX as u128) as u64,
+        )
+    }
+
+    #[cfg(feature = "one-block-test")]
+    fn one_block_print_clock_tree(&self) {
+        let bus_root_addr = JH7110_SYSCRG_BASE_PADDR + 4 * JH7110_SYSCLK_BUS_ROOT;
+        let axi_cfg0_addr = JH7110_SYSCRG_BASE_PADDR + 4 * JH7110_SYSCLK_AXI_CFG0;
+        let sdio1_addr = JH7110_SYSCRG_BASE_PADDR + 4 * JH7110_SYSCLK_SDIO1_SDCARD;
+        let pll2_cfg0_addr = JH7110_SYS_SYSCON_BASE_PADDR + 0x2c;
+        let pll2_cfg1_addr = JH7110_SYS_SYSCON_BASE_PADDR + 0x30;
+        let pll2_cfg2_addr = JH7110_SYS_SYSCON_BASE_PADDR + 0x34;
+
+        let bus_root = Self::one_block_mmio_read_u32(bus_root_addr);
+        let axi_cfg0 = Self::one_block_mmio_read_u32(axi_cfg0_addr);
+        let sdio1_sdcard = Self::one_block_mmio_read_u32(sdio1_addr);
+        let pll2_cfg0 = Self::one_block_mmio_read_u32(pll2_cfg0_addr);
+        let pll2_cfg1 = Self::one_block_mmio_read_u32(pll2_cfg1_addr);
+        let pll2_cfg2 = Self::one_block_mmio_read_u32(pll2_cfg2_addr);
+
+        warn!(
+            "ONE_BLOCK_CLOCK_RAW BUS_ROOT[0x{:08x}]=0x{:08x} \
+             AXI_CFG0[0x{:08x}]=0x{:08x} SDIO1_SDCARD[0x{:08x}]=0x{:08x} \
+             PLL2_CFG0[0x{:08x}]=0x{:08x} PLL2_CFG1[0x{:08x}]=0x{:08x} \
+             PLL2_CFG2[0x{:08x}]=0x{:08x}",
+            bus_root_addr,
+            bus_root,
+            axi_cfg0_addr,
+            axi_cfg0,
+            sdio1_addr,
+            sdio1_sdcard,
+            pll2_cfg0_addr,
+            pll2_cfg0,
+            pll2_cfg1_addr,
+            pll2_cfg1,
+            pll2_cfg2_addr,
+            pll2_cfg2,
+        );
+
+        let pll2_hz = Self::one_block_pll2_rate_hz(pll2_cfg0, pll2_cfg1, pll2_cfg2);
+        let bus_root_mux = (bus_root >> 24) & 0xf;
+        let (bus_root_parent, bus_root_parent_name) = match bus_root_mux {
+            0 => (Some(JH7110_OSC_CLOCK_HZ), "osc"),
+            1 => (pll2_hz, "pll2"),
+            _ => (None, "invalid"),
+        };
+        let axi_cfg0_divider = (axi_cfg0 & 0x00ff_ffff) as u64;
+        let axi_cfg0_hz = bus_root_parent
+            .filter(|_| axi_cfg0_divider != 0)
+            .map(|parent| parent / axi_cfg0_divider);
+        let sdio1_enabled = sdio1_sdcard & (1 << 31) != 0;
+        let sdio1_divider = (sdio1_sdcard & 0x00ff_ffff) as u64;
+        let ciu_hz = axi_cfg0_hz
+            .filter(|_| sdio1_enabled && sdio1_divider != 0)
+            .map(|parent| parent / sdio1_divider);
+        let dw_divider = self.regs.clkdiv().read().clk_divider0() as u64;
+        let sdclk_hz = ciu_hz.map(|ciu| {
+            if dw_divider == 0 {
+                ciu
+            } else {
+                ciu / (2 * dw_divider)
+            }
+        });
+        let root_source_valid = match bus_root_mux {
+            0 => true,
+            1 => pll2_hz.is_some(),
+            _ => false,
+        };
+        let valid = root_source_valid
+            && bus_root_parent.is_some()
+            && axi_cfg0_hz.is_some()
+            && ciu_hz.is_some()
+            && sdclk_hz.is_some();
+
+        warn!(
+            "ONE_BLOCK_CLOCK_TREE osc_hz={} pll2_hz={} bus_root_mux={} \
+             bus_root_parent={} bus_root_hz={} axi_cfg0_divider={} axi_cfg0_hz={} \
+             sdio1_gate={} sdio1_divider={} ciu_hz={} dw_clkdiv={} sdclk_hz={} status={}",
+            JH7110_OSC_CLOCK_HZ,
+            pll2_hz.unwrap_or(0),
+            bus_root_mux,
+            bus_root_parent_name,
+            bus_root_parent.unwrap_or(0),
+            axi_cfg0_divider,
+            axi_cfg0_hz.unwrap_or(0),
+            sdio1_enabled,
+            sdio1_divider,
+            ciu_hz.unwrap_or(0),
+            dw_divider,
+            sdclk_hz.unwrap_or(0),
+            if valid { "ok" } else { "invalid_register_chain" },
+        );
+    }
+
+    #[cfg(feature = "one-block-test")]
+    fn one_block_read_region(&mut self, buffer: &mut [u8]) {
+        assert_eq!(buffer.len(), ONE_BLOCK_TEST_BLOCKS * Self::BLOCK_SIZE);
+        for (block_index, block) in buffer
+            .chunks_exact_mut(Self::BLOCK_SIZE)
+            .enumerate()
+        {
+            self.read_block(
+                ONE_BLOCK_TEST_START_LBA + block_index as u32,
+                block.try_into().unwrap(),
+            );
+        }
+    }
+
+    #[cfg(feature = "one-block-test")]
+    fn one_block_write_region(&mut self, buffer: &[u8]) {
+        assert_eq!(buffer.len(), ONE_BLOCK_TEST_BLOCKS * Self::BLOCK_SIZE);
+        for (block_index, block) in buffer.chunks_exact(Self::BLOCK_SIZE).enumerate() {
+            self.write_block(
+                ONE_BLOCK_TEST_START_LBA + block_index as u32,
+                block.try_into().unwrap(),
+            );
+        }
+    }
+
+    #[cfg(feature = "one-block-test")]
+    fn one_block_fill_pattern(buffer: &mut [u8], round: usize) {
+        for (block_index, block) in buffer.chunks_exact_mut(Self::BLOCK_SIZE).enumerate() {
+            let lba = ONE_BLOCK_TEST_START_LBA + block_index as u32;
+            for (byte_index, byte) in block.iter_mut().enumerate() {
+                let mut value = ((lba as u64) << 32)
+                    ^ ((round as u64) << 16)
+                    ^ byte_index as u64
+                    ^ 0x9e37_79b9_7f4a_7c15;
+                value ^= value >> 30;
+                value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                value ^= value >> 27;
+                value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+                value ^= value >> 31;
+                *byte = value as u8;
+            }
+        }
+    }
+
+    #[cfg(feature = "one-block-test")]
+    fn one_block_first_mismatch(actual: &[u8], expected: &[u8]) -> Option<(usize, u8, u8)> {
+        actual
+            .iter()
+            .zip(expected)
+            .enumerate()
+            .find_map(|(offset, (&actual, &expected))| {
+                (actual != expected).then_some((offset, expected, actual))
+            })
+    }
+
+    #[cfg(feature = "one-block-test")]
+    fn run_one_block_test(&mut self) {
+        let test_end_lba = ONE_BLOCK_TEST_START_LBA + ONE_BLOCK_TEST_BLOCKS as u32 - 1;
+        assert!(
+            self.num_blocks > test_end_lba as u64,
+            "one-block-test region exceeds the detected card capacity"
+        );
+        assert!(
+            self.dma_buffer.is_some(),
+            "one-block-test requires the IDMAC bounce buffer"
+        );
+
+        warn!(
+            "ONE_BLOCK_TEST begin start_lba={} end_lba={} blocks={} bytes={} rounds={} \
+             warning=raw_region_is_temporarily_overwritten",
+            ONE_BLOCK_TEST_START_LBA,
+            test_end_lba,
+            ONE_BLOCK_TEST_BLOCKS,
+            ONE_BLOCK_TEST_BLOCKS * Self::BLOCK_SIZE,
+            ONE_BLOCK_TEST_ROUNDS,
+        );
+        warn!(
+            "ONE_BLOCK_REGISTERS CLKDIV=0x{:08x} CLKSRC=0x{:08x} CLKENA=0x{:08x} \
+             CTYPE=0x{:08x} FIFOTH=0x{:08x} BMOD=0x{:08x} HCON=0x{:08x} UHS=0x{:08x}",
+            self.regs.clkdiv().read().into_bits(),
+            self.regs.clksrc().read().into_bits(),
+            self.regs.clkena().read().into_bits(),
+            self.regs.ctype().read().into_bits(),
+            self.regs.fifoth().read().into_bits(),
+            self.regs.bmod().read().into_bits(),
+            self.regs.hcon().read().into_bits(),
+            self.regs.uhs().read().into_bits(),
+        );
+        self.one_block_print_clock_tree();
+        let hcon_area_optimized = self.regs.hcon().read().area_opt();
+        warn!(
+            "ONE_BLOCK_TCBCNT_CAPABILITY hcon_area_optimized={} \
+             in_transfer_reads_supported={} counter_register_offset=0x005c",
+            hcon_area_optimized,
+            !hcon_area_optimized,
+        );
+
+        let mut timer_stats = OneBlockPhaseStats::new();
+        for _ in 0..ONE_BLOCK_TIMER_SAMPLES {
+            let started_ns = axhal::time::monotonic_time_nanos();
+            timer_stats.record(
+                axhal::time::monotonic_time_nanos().saturating_sub(started_ns),
+            );
+        }
+        warn!(
+            "ONE_BLOCK_TIMER samples={} average_ns={} min_ns={} max_ns={}",
+            timer_stats.count,
+            timer_stats.average_ns(),
+            timer_stats.min_ns,
+            timer_stats.max_ns,
+        );
+
+        let region_bytes = ONE_BLOCK_TEST_BLOCKS * Self::BLOCK_SIZE;
+        let mut backup = vec![0u8; region_bytes];
+        let mut transfer_buffer = vec![0u8; region_bytes];
+        let mut expected = vec![0u8; region_bytes];
+
+        self.one_block_profiler.enabled = false;
+        warn!("ONE_BLOCK_TEST stage=backup status=begin");
+        self.one_block_read_region(&mut backup);
+        warn!("ONE_BLOCK_TEST stage=backup status=complete");
+
+        // The backup pass warms the complete sequential read range. This extra pass
+        // verifies that the reference is stable before any write is attempted.
+        self.one_block_read_region(&mut transfer_buffer);
+        if let Some((offset, expected_byte, actual_byte)) =
+            Self::one_block_first_mismatch(&transfer_buffer, &backup)
+        {
+            panic!(
+                "one-block-test read warm-up mismatch at byte {}: expected=0x{:02x}, actual=0x{:02x}",
+                offset, expected_byte, actual_byte
+            );
+        }
+        warn!("ONE_BLOCK_TEST stage=read_warmup status=ok");
+
+        let _ = self.one_block_profiler.take(OneBlockOperation::Read);
+        let mut read_total = OneBlockProfileStats::new();
+        for round in 1..=ONE_BLOCK_TEST_ROUNDS {
+            self.one_block_profiler.enabled = true;
+            self.one_block_read_region(&mut transfer_buffer);
+            self.one_block_profiler.enabled = false;
+            let round_stats = self.one_block_profiler.take(OneBlockOperation::Read);
+            let mismatch = Self::one_block_first_mismatch(&transfer_buffer, &backup);
+            Self::one_block_print_round(
+                OneBlockOperation::Read,
+                round,
+                round_stats,
+                mismatch.is_none(),
+            );
+            read_total.merge(round_stats);
+            if let Some((offset, expected_byte, actual_byte)) = mismatch {
+                panic!(
+                    "one-block-test measured read mismatch in round {} at byte {}: \
+                     expected=0x{:02x}, actual=0x{:02x}",
+                    round, offset, expected_byte, actual_byte
+                );
+            }
+        }
+        Self::one_block_print_profile(OneBlockOperation::Read, read_total);
+
+        // Warm the write path before measuring it. From this point onward every exit
+        // must restore the original region before reporting a data mismatch.
+        Self::one_block_fill_pattern(&mut expected, 0);
+        self.one_block_write_region(&expected);
+        self.one_block_read_region(&mut transfer_buffer);
+        let mut write_failure = Self::one_block_first_mismatch(&transfer_buffer, &expected)
+            .map(|(offset, expected_byte, actual_byte)| {
+                (0usize, offset, expected_byte, actual_byte)
+            });
+        warn!(
+            "ONE_BLOCK_TEST stage=write_warmup status={}",
+            if write_failure.is_none() {
+                "ok"
+            } else {
+                "failed"
+            }
+        );
+
+        let _ = self.one_block_profiler.take(OneBlockOperation::Write);
+        let mut write_total = OneBlockProfileStats::new();
+        if write_failure.is_none() {
+            for round in 1..=ONE_BLOCK_TEST_ROUNDS {
+                Self::one_block_fill_pattern(&mut expected, round);
+                self.one_block_profiler.enabled = true;
+                self.one_block_write_region(&expected);
+                self.one_block_profiler.enabled = false;
+                let round_stats = self.one_block_profiler.take(OneBlockOperation::Write);
+
+                self.one_block_read_region(&mut transfer_buffer);
+                let mismatch = Self::one_block_first_mismatch(&transfer_buffer, &expected);
+                Self::one_block_print_round(
+                    OneBlockOperation::Write,
+                    round,
+                    round_stats,
+                    mismatch.is_none(),
+                );
+                write_total.merge(round_stats);
+                if let Some((offset, expected_byte, actual_byte)) = mismatch {
+                    write_failure = Some((round, offset, expected_byte, actual_byte));
+                    break;
+                }
+            }
+        }
+        Self::one_block_print_profile(OneBlockOperation::Write, write_total);
+
+        self.one_block_profiler.enabled = false;
+        warn!("ONE_BLOCK_TEST stage=restore status=begin");
+        self.one_block_write_region(&backup);
+        self.one_block_read_region(&mut transfer_buffer);
+        if let Some((offset, expected_byte, actual_byte)) =
+            Self::one_block_first_mismatch(&transfer_buffer, &backup)
+        {
+            panic!(
+                "one-block-test RESTORE FAILED at byte {} (LBA {}, byte {}): \
+                 expected=0x{:02x}, actual=0x{:02x}",
+                offset,
+                ONE_BLOCK_TEST_START_LBA + (offset / Self::BLOCK_SIZE) as u32,
+                offset % Self::BLOCK_SIZE,
+                expected_byte,
+                actual_byte,
+            );
+        }
+        warn!("ONE_BLOCK_TEST stage=restore status=verified");
+
+        if let Some((round, offset, expected_byte, actual_byte)) = write_failure {
+            panic!(
+                "one-block-test write validation failed in round {} at byte {} (LBA {}, byte {}): \
+                 expected=0x{:02x}, actual=0x{:02x}; original data was restored",
+                round,
+                offset,
+                ONE_BLOCK_TEST_START_LBA + (offset / Self::BLOCK_SIZE) as u32,
+                offset % Self::BLOCK_SIZE,
+                expected_byte,
+                actual_byte,
+            );
+        }
+
+        warn!("ONE_BLOCK_TEST complete status=ok original_region_restored=true");
     }
 
     fn can_send_cmd(&self) -> bool {
@@ -792,7 +1873,13 @@ impl SdMmc {
 
     /// Reads a single block from the SD/MMC card.
     pub fn read_block(&mut self, block: u32, buf: &mut [u8; 512]) {
+        #[cfg(feature = "one-block-test")]
+        self.one_block_profiler.begin(OneBlockOperation::Read);
+        #[cfg(feature = "one-block-test")]
+        let phase_start = self.one_block_phase_start();
         self.set_transaction_size(512, 512);
+        #[cfg(feature = "one-block-test")]
+        self.one_block_phase_finish(OneBlockPhase::TransactionConfig, phase_start);
 
         if let Some(dma_buf_info) = &self.dma_buffer {
             let dma_buf_virt_ptr = dma_buf_info.addr.cpu_addr.as_ptr();
@@ -803,11 +1890,17 @@ impl SdMmc {
             self.send_cmd_idmac(Command::ReadSingleBlock(block, dma_buf), dma_bus_addr)
                 .unwrap();
 
+            #[cfg(feature = "one-block-test")]
+            let phase_start = self.one_block_phase_start();
             let dma_usr_slice = unsafe { core::slice::from_raw_parts(dma_buf_virt_ptr, buf.len()) };
             buf.copy_from_slice(dma_usr_slice);
+            #[cfg(feature = "one-block-test")]
+            self.one_block_phase_finish(OneBlockPhase::BounceCopy, phase_start);
         } else {
             panic!("synchronous DMA read requested without an IDMAC buffer");
         }
+        #[cfg(feature = "one-block-test")]
+        self.one_block_profiler.finish();
     }
 
     /// Reads a single block using IDMAC and asynchronously waits for completion.
@@ -833,22 +1926,36 @@ impl SdMmc {
 
     /// Writes a single block to the SD/MMC card.
     pub fn write_block(&mut self, block: u32, buf: &[u8; 512]) {
+        #[cfg(feature = "one-block-test")]
+        self.one_block_profiler.begin(OneBlockOperation::Write);
+        #[cfg(feature = "one-block-test")]
+        let phase_start = self.one_block_phase_start();
         self.set_transaction_size(512, 512);
+        #[cfg(feature = "one-block-test")]
+        self.one_block_phase_finish(OneBlockPhase::TransactionConfig, phase_start);
 
         if let Some(dma_buf_info) = &self.dma_buffer {
             let dma_buf_virt_ptr = dma_buf_info.addr.cpu_addr.as_ptr();
+            let dma_bus_addr = u32::try_from(dma_buf_info.addr.bus_addr.as_u64())
+                .expect("DMA buffer address exceeds the IDMAC 32-bit address range");
+            #[cfg(feature = "one-block-test")]
+            let phase_start = self.one_block_phase_start();
             let dma_usr_slice =
                 unsafe { core::slice::from_raw_parts_mut(dma_buf_virt_ptr, buf.len()) };
             dma_usr_slice.copy_from_slice(buf);
+            #[cfg(feature = "one-block-test")]
+            self.one_block_phase_finish(OneBlockPhase::BounceCopy, phase_start);
 
             let dma_buf = unsafe { core::slice::from_raw_parts(dma_buf_virt_ptr, buf.len()) };
-            let dma_bus_addr = u32::try_from(dma_buf_info.addr.bus_addr.as_u64())
-                .expect("DMA buffer address exceeds the IDMAC 32-bit address range");
             self.send_cmd_idmac(Command::WriteSingleBlock(block, dma_buf), dma_bus_addr)
                 .unwrap();
+            #[cfg(feature = "one-block-test")]
+            self.one_block_wait_card_idle();
         } else {
             panic!("synchronous DMA write requested without an IDMAC buffer");
         }
+        #[cfg(feature = "one-block-test")]
+        self.one_block_profiler.finish();
     }
 
     /// Writes a single block using IDMAC and asynchronously waits for completion.
@@ -1105,6 +2212,8 @@ impl SdMmc {
             "send_cmd_idmac requires a data buffer for transfer"
         );
 
+        #[cfg(feature = "one-block-test")]
+        let phase_start = self.one_block_phase_start();
         let cmd_idle_deadline = axhal::time::monotonic_time() + Duration::from_secs(1);
         while !self.can_send_cmd() {
             if axhal::time::monotonic_time() >= cmd_idle_deadline {
@@ -1137,8 +2246,12 @@ impl SdMmc {
             }
             core::hint::spin_loop();
         }
+        #[cfg(feature = "one-block-test")]
+        self.one_block_phase_finish(OneBlockPhase::IdleWait, phase_start);
 
         // Establish a clean W1C status baseline for the new transaction.
+        #[cfg(feature = "one-block-test")]
+        let phase_start = self.one_block_phase_start();
         let stale_rintsts = self.regs.rintsts().read();
         self.regs.rintsts().write(stale_rintsts);
 
@@ -1158,6 +2271,8 @@ impl SdMmc {
 
         IDMAC_DONE_FLAG.store(false, Ordering::Release);
         IDMAC_ERROR_FLAG.store(false, Ordering::Release);
+        #[cfg(feature = "one-block-test")]
+        self.one_block_phase_finish(OneBlockPhase::StatusClear, phase_start);
 
         let buf_len = match xfer {
             DataXfer::Read(buf) => buf.len(),
@@ -1170,11 +2285,17 @@ impl SdMmc {
         );
 
         // One descriptor covers the contiguous single-block buffer.
+        #[cfg(feature = "one-block-test")]
+        let phase_start = self.one_block_phase_start();
         let layout = Layout::new::<IdmacDescriptor>();
         let dma_desc_info =
             unsafe { alloc_coherent(layout) }.expect("Failed to allocate DMA descriptor");
         let desc_ptr = dma_desc_info.cpu_addr.as_ptr() as *mut IdmacDescriptor;
+        #[cfg(feature = "one-block-test")]
+        self.one_block_phase_finish(OneBlockPhase::DescriptorAlloc, phase_start);
 
+        #[cfg(feature = "one-block-test")]
+        let phase_start = self.one_block_phase_start();
         let mut descriptor = IdmacDescriptor::new();
         descriptor.set_desc0_control_descriptor(true, false, false, false, true, true, false);
         descriptor.set_des1_buffer1_size(buf_len as u16);
@@ -1188,6 +2309,8 @@ impl SdMmc {
         self.regs.bytcnt().write(buf_len as u32);
         self.regs.dbaddr().write(desc_phy_addr);
         dma_io_fence();
+        #[cfg(feature = "one-block-test")]
+        self.one_block_phase_finish(OneBlockPhase::DescriptorPublish, phase_start);
 
         Some(IdmacTransferContext {
             cmd,
@@ -1204,13 +2327,19 @@ impl SdMmc {
         mut context: IdmacTransferContext,
     ) -> Option<IdmacTransferContext> {
         let cmd = context.cmd;
+        #[cfg(feature = "one-block-test")]
+        let phase_start = self.one_block_phase_start();
         context.generation = IDMAC_COMPLETION.begin_transfer();
 
         self.regs.cmdarg().write(context.arg);
         dma_io_fence();
         self.regs.cmd().write(cmd);
         dma_io_fence();
+        #[cfg(feature = "one-block-test")]
+        self.one_block_phase_finish(OneBlockPhase::CommandIssue, phase_start);
 
+        #[cfg(feature = "one-block-test")]
+        let phase_start = self.one_block_phase_start();
         let mut start_cmd_wait_count = 0u64;
         let start_cmd_deadline = axhal::time::monotonic_time() + Duration::from_millis(100);
         while self.regs.cmd().read().start_cmd() {
@@ -1236,7 +2365,11 @@ impl SdMmc {
                 return None;
             }
         }
+        #[cfg(feature = "one-block-test")]
+        self.one_block_phase_finish(OneBlockPhase::CommandAccept, phase_start);
 
+        #[cfg(feature = "one-block-test")]
+        let phase_start = self.one_block_phase_start();
         let idsts_before_pldmnd = self.regs.idsts().read();
         if idsts_before_pldmnd.du() {
             warn!(
@@ -1283,6 +2416,8 @@ impl SdMmc {
                 dbaddr,
             );
         }
+        #[cfg(feature = "one-block-test")]
+        self.one_block_phase_finish(OneBlockPhase::PostStartChecks, phase_start);
 
         Some(context)
     }
@@ -1369,33 +2504,56 @@ impl SdMmc {
     }
 
     fn wait_transfer_sync(
-        &self,
+        &mut self,
         context: &IdmacTransferContext,
     ) -> Result<(), IdmacWaitError> {
+        #[cfg(feature = "one-block-test")]
+        let phase_start = self.one_block_phase_start();
         if context.cmd.response_expect() {
             let deadline = axhal::time::wall_time() + Duration::from_secs(2);
             while !self.idmac_command_done_or_error(context) {
                 if axhal::time::wall_time() >= deadline {
+                    #[cfg(feature = "one-block-test")]
+                    self.one_block_phase_finish(OneBlockPhase::CommandResponse, phase_start);
                     return Err(IdmacWaitError::CommandTimeout);
                 }
                 core::hint::spin_loop();
             }
         }
+        #[cfg(feature = "one-block-test")]
+        self.one_block_phase_finish(OneBlockPhase::CommandResponse, phase_start);
 
+        #[cfg(feature = "one-block-test")]
+        let phase_start = self.one_block_phase_start();
         let (rintsts, idsts) = self.idmac_completion_status(context.generation);
         if Self::idmac_status_has_error(&rintsts, &idsts) {
+            #[cfg(feature = "one-block-test")]
+            self.one_block_phase_finish(OneBlockPhase::DataTransfer, phase_start);
             return Err(IdmacWaitError::Hardware);
         }
 
+        #[cfg(feature = "one-block-test")]
+        let mut tcbcnt_sample = self.one_block_tcbcnt_begin(context);
         let deadline = axhal::time::wall_time() + Duration::from_secs(5);
         while !self.idmac_terminal_events_or_error(context) {
+            #[cfg(feature = "one-block-test")]
+            self.one_block_tcbcnt_observe(&mut tcbcnt_sample);
             if axhal::time::wall_time() >= deadline {
+                #[cfg(feature = "one-block-test")]
+                {
+                    self.one_block_tcbcnt_finish(&mut tcbcnt_sample);
+                    self.one_block_phase_finish(OneBlockPhase::DataTransfer, phase_start);
+                }
                 return Err(IdmacWaitError::DataTimeout);
             }
             core::hint::spin_loop();
         }
 
+        #[cfg(feature = "one-block-test")]
+        self.one_block_tcbcnt_finish(&mut tcbcnt_sample);
         let (rintsts, idsts) = self.idmac_completion_status(context.generation);
+        #[cfg(feature = "one-block-test")]
+        self.one_block_phase_finish(OneBlockPhase::DataTransfer, phase_start);
         if Self::idmac_status_has_error(&rintsts, &idsts) {
             Err(IdmacWaitError::Hardware)
         } else {
