@@ -16,6 +16,11 @@ use crate::{
     utils::{Cid, CsdV2},
 };
 
+// VisionFive 2 supplies a 100 MHz CIU clock to SDIO1. DW-MMC divides it by 2*n.
+const VISIONFIVE2_SDIO_CIU_CLOCK_HZ: u32 = 100_000_000;
+const IDENTIFICATION_CLOCK_DIVIDER: u8 = 100;
+const DEFAULT_SPEED_CLOCK_DIVIDER: u8 = 2;
+
 fn wait_until<F>(mut f: F)
 where
     F: FnMut() -> bool,
@@ -346,6 +351,69 @@ impl SdMmc {
         self.regs.bytcnt().write(byte_cnt);
     }
 
+    fn program_card_clock_divider(&self, divider: u8) -> bool {
+        self.regs.clkena().write(ClkEna::new());
+        if self.send_cmd(Command::ResetClock).is_none() {
+            warn!("failed to latch disabled card clock before setting CLKDIV={divider}");
+            return false;
+        }
+
+        self.regs
+            .clkdiv()
+            .write(ClkDiv::new().with_clk_divider0(divider));
+        if self.send_cmd(Command::ResetClock).is_none() {
+            warn!("failed to latch CLKDIV={divider} while card clock was disabled");
+            return false;
+        }
+
+        self.regs.clkena().write(ClkEna::new().with_cclk_enable(1));
+        if self.send_cmd(Command::ResetClock).is_none() {
+            warn!("failed to re-enable card clock after setting CLKDIV={divider}");
+            return false;
+        }
+
+        let actual_divider = self.regs.clkdiv().read().clk_divider0();
+        let clock_enabled = self.regs.clkena().read().cclk_enable() & 1 != 0;
+        if actual_divider != divider || !clock_enabled {
+            warn!(
+                "card clock register verification failed: requested_divider={}, \
+                 actual_divider={}, enabled={}",
+                divider, actual_divider, clock_enabled,
+            );
+            return false;
+        }
+        true
+    }
+
+    fn switch_card_clock_divider(&self, divider: u8) -> bool {
+        let idle_deadline = axhal::time::monotonic_time() + Duration::from_secs(1);
+        while !self.can_send_cmd() || !self.can_send_data() {
+            if axhal::time::monotonic_time() >= idle_deadline {
+                warn!(
+                    "card did not become idle before clock switch: CMD={:?}, STATUS={:?}",
+                    self.regs.cmd().read(),
+                    self.regs.status().read(),
+                );
+                return false;
+            }
+            core::hint::spin_loop();
+        }
+
+        let previous_divider = self.regs.clkdiv().read().clk_divider0();
+        if self.program_card_clock_divider(divider) {
+            return true;
+        }
+
+        warn!(
+            "card clock switch to CLKDIV={} failed; attempting rollback to CLKDIV={}",
+            divider, previous_divider,
+        );
+        if !self.program_card_clock_divider(previous_divider) {
+            warn!("card clock rollback failed; further transfers are unsafe");
+        }
+        false
+    }
+
     fn send_cmd(&self, command: Command<'_>) -> Option<[u32; 4]> {
         let is_reset_clock = matches!(command, Command::ResetClock);
         let expects_busy = matches!(command, Command::SelectCard(_));
@@ -562,7 +630,7 @@ impl SdMmc {
         }
         self.regs
             .clkdiv()
-            .write(ClkDiv::new().with_clk_divider0(100));
+            .write(ClkDiv::new().with_clk_divider0(IDENTIFICATION_CLOCK_DIVIDER));
         self.regs.clkena().write(ClkEna::new().with_cclk_enable(1));
         if self.send_cmd(Command::ResetClock).is_none() {
             warn!("ResetClock failed while enabling card clock; continuing");
@@ -705,6 +773,19 @@ impl SdMmc {
 
         let rintsts = self.regs.rintsts().read();
         self.regs.rintsts().write(rintsts);
+
+        if !self.switch_card_clock_divider(DEFAULT_SPEED_CLOCK_DIVIDER) {
+            warn!("failed to enter SD Default Speed; disabling block transfers");
+            self.num_blocks = 0;
+            return;
+        }
+        let card_clock_hz =
+            VISIONFIVE2_SDIO_CIU_CLOCK_HZ / (2 * DEFAULT_SPEED_CLOCK_DIVIDER as u32);
+        warn!(
+            "SD/MMC card clock switched to Default Speed: ciu_clock_hz={}, CLKDIV={}, \
+             card_clock_hz={}",
+            VISIONFIVE2_SDIO_CIU_CLOCK_HZ, DEFAULT_SPEED_CLOCK_DIVIDER, card_clock_hz,
+        );
 
         info!("SD/MMC driver initialized");
     }
@@ -1015,7 +1096,6 @@ impl SdMmc {
         }
 
         let (cmd, arg, xfer) = command.build();
-        let is_write = cmd.read_write();
         assert!(
             cmd.data_expected(),
             "send_cmd_idmac should only be used for commands that require data transfer"
@@ -1108,23 +1188,6 @@ impl SdMmc {
         self.regs.bytcnt().write(buf_len as u32);
         self.regs.dbaddr().write(desc_phy_addr);
         dma_io_fence();
-
-        if is_write {
-            let descriptor_ready_deadline =
-                axhal::time::monotonic_time() + Duration::from_millis(100);
-            while self.regs.idsts().read().fsm() != 3 {
-                if axhal::time::monotonic_time() >= descriptor_ready_deadline {
-                    debug!(
-                        "send_cmd_idmac: IDMAC did not enter DESC_CHK before CMD24; continuing \
-                         with IDSTS={:?}",
-                        self.regs.idsts().read(),
-                    );
-                    break;
-                }
-                core::hint::spin_loop();
-            }
-            dma_io_fence();
-        }
 
         Some(IdmacTransferContext {
             cmd,
