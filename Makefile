@@ -55,6 +55,8 @@ la:
 	$(MAKE) ARCH=loongarch64 run
 
 vf2:
-	$(MAKE) ARCH=riscv64 APP_FEATURES=vf2 MYPLAT=axplat-riscv64-visionfive2 BUS=mmio build
+	$(MAKE) ARCH=riscv64 APP_FEATURES=vf2 \
+		MYPLAT=axplat-riscv64-visionfive2 BUS=mmio \
+		TARGET_DIR=$(PWD)/target/vf2 build
 
 .PHONY: build run justrun debug disasm clean

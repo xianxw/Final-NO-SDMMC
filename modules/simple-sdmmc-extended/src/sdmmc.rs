@@ -16,10 +16,11 @@ use crate::{
     utils::{Cid, CsdV2},
 };
 
-// VisionFive 2 supplies a 100 MHz CIU clock to SDIO1. DW-MMC divides it by 2*n.
-const VISIONFIVE2_SDIO_CIU_CLOCK_HZ: u32 = 100_000_000;
+// VisionFive 2 firmware configures SDIO1 CIU as PLL2 / 3 / 8 = 49.5 MHz.
+// For CLKDIV=n, DW-MMC outputs CIU / (2*n) to the card.
+const VISIONFIVE2_SDIO_CIU_CLOCK_HZ: u32 = 49_500_000;
 const IDENTIFICATION_CLOCK_DIVIDER: u8 = 100;
-const DEFAULT_SPEED_CLOCK_DIVIDER: u8 = 2;
+const DEFAULT_SPEED_CLOCK_DIVIDER: u8 = 1;
 
 fn wait_until<F>(mut f: F)
 where
