@@ -47,6 +47,10 @@ bcm2835-sdhci = ["dep:bcm2835-sdhci"]
 ramdisk = []
 ramdisk-static = []
 sdmmc = ["dep:simple-sdmmc"]
+# BEGIN SDMMC TEST ONLY
+sdmmc-async-read-test = ["sdmmc", "simple-sdmmc/sdmmc-async-read-test"]
+sdmmc-error-irq-test = ["sdmmc", "simple-sdmmc/sdmmc-error-irq-test"]
+# END SDMMC TEST ONLY
 
 [lib]
 name = "axdriver_block"

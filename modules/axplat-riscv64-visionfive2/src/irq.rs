@@ -36,6 +36,12 @@ static IPI_HANDLER: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 /// The maximum number of IRQs.
 pub const MAX_IRQ_COUNT: usize = 1024;
 
+// JH7110 exposes sources 1..=136. PLIC context-enable windows use the
+// standard 0x80-byte stride, so five u32 words cover all implemented sources.
+const JH7110_PLIC_ENABLE_WORDS: usize = 5;
+const PLIC_ENABLE_OFFSET: usize = 0x002000;
+const PLIC_ENABLE_CONTEXT_STRIDE: usize = 0x80;
+
 static IRQ_HANDLER_TABLE: HandlerTable<MAX_IRQ_COUNT> = HandlerTable::new();
 
 static PLIC: SpinNoIrq<Plic> = SpinNoIrq::new(unsafe {
@@ -48,6 +54,29 @@ fn this_context() -> usize {
     hart_id * 2 // supervisor context
 }
 
+#[inline]
+fn plic_io_fence() {
+    unsafe {
+        core::arch::asm!("fence iorw, iorw", options(nostack, preserves_flags));
+    }
+}
+
+fn clear_context_enables(context: usize) {
+    let context_base = PHYS_VIRT_OFFSET
+        + PLIC_PADDR
+        + PLIC_ENABLE_OFFSET
+        + context * PLIC_ENABLE_CONTEXT_STRIDE;
+    for word in 0..JH7110_PLIC_ENABLE_WORDS {
+        unsafe {
+            core::ptr::write_volatile(
+                (context_base + word * core::mem::size_of::<u32>()) as *mut u32,
+                0,
+            );
+        }
+    }
+    plic_io_fence();
+}
+
 pub(super) fn init_percpu() {
     // enable soft interrupts, timer interrupts, and external interrupts
     unsafe {
@@ -55,7 +84,15 @@ pub(super) fn init_percpu() {
         sie::set_stimer();
         sie::set_sext();
     }
-    PLIC.lock().init_by_context(this_context());
+
+    let context = this_context();
+    let mut plic = PLIC.lock();
+    // Firmware-owned enable bits must not be carried into this kernel. Clear
+    // each implemented word exactly; per-source RMW would preserve that state.
+    plic.set_threshold(context, u32::MAX);
+    clear_context_enables(context);
+    plic.init_by_context(context);
+    plic_io_fence();
 }
 
 macro_rules! with_cause {
@@ -109,6 +146,7 @@ impl IrqIf for IrqIfImpl {
                     info!("PLIC disable IRQ {} for context {}", irq, this_context());
                     plic.disable(irq, this_context());
                 }
+                plic_io_fence();
             }
         );
     }

@@ -216,6 +216,22 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
     #[cfg(feature = "multitask")]
     axtask::init_scheduler();
 
+    // BEGIN SDMMC TEST ONLY
+    // Async SDMMC diagnostics run during device construction, before the block
+    // device is moved into the filesystem. Enable IRQs early only in those images.
+    #[cfg(all(
+        feature = "irq",
+        any(
+            feature = "sdmmc-async-read-test",
+            feature = "sdmmc-error-irq-test"
+        )
+    ))]
+    {
+        info!("SDMMC_TEST_RUNTIME enabling IRQs before driver diagnostics");
+        init_interrupt();
+    }
+    // END SDMMC TEST ONLY
+
     #[cfg(feature = "axdriver")]
     {
         #[allow(unused_variables)]
@@ -251,11 +267,20 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
     #[cfg(feature = "smp")]
     self::mp::start_secondary_cpus(cpu_id);
 
-    #[cfg(feature = "irq")]
+    // BEGIN SDMMC TEST ONLY
+    // Restore this to `#[cfg(feature = "irq")]` when removing the diagnostic images.
+    #[cfg(all(
+        feature = "irq",
+        not(any(
+            feature = "sdmmc-async-read-test",
+            feature = "sdmmc-error-irq-test"
+        ))
+    ))]
     {
         info!("Initialize interrupt handlers...");
         init_interrupt();
     }
+    // END SDMMC TEST ONLY
 
     #[cfg(all(feature = "tls", not(feature = "multitask")))]
     {

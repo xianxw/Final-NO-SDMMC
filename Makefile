@@ -59,4 +59,23 @@ vf2:
 		MYPLAT=axplat-riscv64-visionfive2 BUS=mmio \
 		TARGET_DIR=$(PWD)/target/vf2 build
 
-.PHONY: build run justrun debug disasm clean
+# BEGIN SDMMC TEST ONLY - diagnostic images never enter the filesystem.
+vf2-sdmmc-async-read-test:
+	$(MAKE) ARCH=riscv64 APP_FEATURES=sdmmc-async-read-test \
+		MYPLAT=axplat-riscv64-visionfive2 BUS=mmio \
+		TARGET_DIR=$(PWD)/target/sdmmc-async-read-test build
+	@cp $(PWD)/Final-NO-SDMMC_visionfive2.bin \
+		$(PWD)/Final-NO-SDMMC_visionfive2-sdmmc-async-read-test.bin
+
+vf2-sdmmc-error-irq-test:
+	$(MAKE) ARCH=riscv64 APP_FEATURES=sdmmc-error-irq-test \
+		MYPLAT=axplat-riscv64-visionfive2 BUS=mmio \
+		TARGET_DIR=$(PWD)/target/sdmmc-error-irq-test build
+	@cp $(PWD)/Final-NO-SDMMC_visionfive2.bin \
+		$(PWD)/Final-NO-SDMMC_visionfive2-sdmmc-error-irq-test.bin
+# END SDMMC TEST ONLY
+
+.PHONY: build run justrun debug disasm clean vf2
+# BEGIN SDMMC TEST ONLY
+.PHONY: vf2-sdmmc-async-read-test vf2-sdmmc-error-irq-test
+# END SDMMC TEST ONLY

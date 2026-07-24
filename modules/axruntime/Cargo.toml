@@ -77,6 +77,20 @@ smp = [
     "axhal/smp",
     "axtask?/smp",
 ]
+# BEGIN SDMMC TEST ONLY
+sdmmc-async-read-test = [
+    "axdriver",
+    "axdriver/sdmmc-async-read-test",
+    "irq",
+    "multitask",
+]
+sdmmc-error-irq-test = [
+    "axdriver",
+    "axdriver/sdmmc-error-irq-test",
+    "irq",
+    "multitask",
+]
+# END SDMMC TEST ONLY
 tls = [
     "axhal/tls",
     "axtask?/tls",

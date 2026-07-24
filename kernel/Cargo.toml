@@ -13,6 +13,10 @@ dev-log = []
 input = ["dep:axinput", "axfeat/input"]
 memtrack = ["axfeat/dwarf", "axalloc/tracking", "dep:gimli"]
 vsock = ["axfeat/vsock"]
+# BEGIN SDMMC TEST ONLY
+sdmmc-async-read-test = ["axruntime/sdmmc-async-read-test"]
+sdmmc-error-irq-test = ["axruntime/sdmmc-error-irq-test"]
+# END SDMMC TEST ONLY
 
 [dependencies]
 axfeat = { workspace = true, features = [

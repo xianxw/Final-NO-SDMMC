@@ -67,6 +67,11 @@ smp = ["axfeat/smp", "axplat-riscv64-visionfive2?/smp"]
 
 vf2 = ["dep:axplat-riscv64-visionfive2", "axfeat/driver-sdmmc"]
 
+# BEGIN SDMMC TEST ONLY - remove this block with the diagnostic images.
+sdmmc-async-read-test = ["vf2", "starry-kernel/sdmmc-async-read-test"]
+sdmmc-error-irq-test = ["vf2", "starry-kernel/sdmmc-error-irq-test"]
+# END SDMMC TEST ONLY
+
 [[bin]]
 name = "starryos"
 path = "src/main.rs"
