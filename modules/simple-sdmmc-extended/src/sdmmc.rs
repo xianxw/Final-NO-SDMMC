@@ -25,6 +25,11 @@ const MAX_DMA_BLOCKS: usize = 32;
 const DMA_BUFFER_SIZE: usize = MAX_DMA_BLOCKS * 512;
 const IDMAC_DESCRIPTOR_BUFFER_SIZE: usize = 8 * 512;
 const MIN_MULTI_BLOCK_READ_BLOCKS: usize = 4;
+const PRE_SUBMIT_IDLE_SPIN_TIMEOUT: Duration = Duration::from_micros(100);
+const START_CMD_SPIN_TIMEOUT: Duration = Duration::from_millis(1);
+const IDMAC_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+// Fallback only: controller TMOUT errors normally wake the waiter through IRQ.
+const IDMAC_DATA_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn wait_until<F>(mut f: F)
 where
@@ -118,12 +123,45 @@ struct IdmacTransferContext {
     descriptor_count: usize,
 }
 
+/// Errors returned by SD/MMC block transfers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum IdmacWaitError {
+pub enum SdMmcError {
+    /// The transfer buffer is empty or is not block aligned.
+    InvalidParameter,
+    /// The requested block range exceeds the detected card capacity.
+    OutOfRange,
+    /// IDMAC was not initialized, so block transfers are unavailable.
+    DmaUnavailable,
+    /// A coherent DMA descriptor allocation failed.
+    DmaAllocation,
+    /// A DMA buffer or descriptor address cannot be represented by this IDMAC.
+    DmaAddress,
+    /// A previous submitted transfer failed or was cancelled.
+    DriverFaulted,
+    /// The command state machine did not become idle before submission.
+    CommandBusy,
+    /// The data state machine did not become idle before submission.
+    DataBusy,
+    /// The controller did not retain the published descriptor configuration.
+    DescriptorPublication,
+    /// The controller did not accept START_CMD within the short polling deadline.
+    CommandStartTimeout,
+    /// The command response phase timed out.
     CommandTimeout,
+    /// The data transfer phase timed out.
     DataTimeout,
+    /// The controller, card, or IDMAC reported a transfer error.
     Hardware,
+    /// Completion registers or descriptors did not reach the required terminal state.
+    TerminalValidation,
+    /// IDMAC could not be stopped safely after a submitted transfer failed.
+    RecoveryFailed,
+    /// The card did not release DAT busy after a write.
+    CardBusyTimeout,
 }
+
+/// Result type returned by SD/MMC block transfers.
+pub type SdMmcResult<T = ()> = Result<T, SdMmcError>;
 
 /// Data width for SD/MMC data transfer, used to configure the CTYPE register of the controller.
 /// Will decide alignment requirements for DMA buffer and data in FIFO.
@@ -183,12 +221,17 @@ impl<'a> ActiveIdmacTransfer<'a> {
         self.context.as_ref().unwrap()
     }
 
-    fn wait_sync(&self) -> Result<(), IdmacWaitError> {
+    fn wait_sync(&self) -> SdMmcResult {
         self.sdmmc.wait_transfer_sync(self.context())
     }
 
-    async fn wait_async(&self) -> Result<(), IdmacWaitError> {
+    async fn wait_async(&self) -> SdMmcResult {
         self.sdmmc.wait_transfer_async(self.context()).await
+    }
+
+    fn status(&self) -> (crate::regs::RIntSts, crate::regs::IdSts) {
+        self.sdmmc
+            .idmac_completion_status(self.context().generation)
     }
 
     fn validate(&self) -> bool {
@@ -203,9 +246,9 @@ impl<'a> ActiveIdmacTransfer<'a> {
         self.sdmmc.idmac_faulted = true;
     }
 
-    fn finish(mut self, recover: bool) -> bool {
+    fn finish(mut self, abort: bool) -> SdMmcResult {
         let context = self.context.take().unwrap();
-        self.sdmmc.finish_idmac_transfer(context, recover)
+        self.sdmmc.finish_idmac_transfer(context, abort)
     }
 }
 
@@ -215,9 +258,13 @@ impl Drop for ActiveIdmacTransfer<'_> {
             return;
         };
 
-        warn!("active IDMAC future dropped; aborting the transfer and faulting the driver");
+        // Cancellation is fail-stop: stop IDMAC before freeing its descriptor and
+        // never reuse controller/card state whose terminal state was not observed.
+        warn!("active IDMAC future dropped; stopping IDMAC and faulting the driver");
         self.sdmmc.idmac_faulted = true;
-        let _ = self.sdmmc.finish_idmac_transfer(context, true);
+        if let Err(error) = self.sdmmc.finish_idmac_transfer(context, true) {
+            warn!("failed to stop cancelled IDMAC transfer safely: {error:?}");
+        }
     }
 }
 
@@ -243,10 +290,26 @@ impl SdMmc {
             idmac_faulted: false,
             idmac_reset_failed: false,
         };
+        this.log_register_snapshot();
         this.init();
         this.try_enable_idmac(DMA_BUFFER_SIZE, AHBDataWidth::Bits32, register_irq);
-
         this
+    }
+
+    fn log_register_snapshot(&self) {
+        let hcon = self.regs.hcon().read().into_bits();
+        let fifoth = self.regs.fifoth().read().into_bits();
+        let bmod = self.regs.bmod().read().into_bits();
+        let tmout = self.regs.tmout().read().into_bits();
+        let clksrc = self.regs.clksrc().read().into_bits();
+        let uhs = self.regs.uhs().read().into_bits();
+        let ctrl = self.regs.ctrl().read().into_bits();
+
+        warn!(
+            "SDMMC_REGISTER_SNAPSHOT stage=pre_init HCON=0x{hcon:08x} FIFOTH=0x{fifoth:08x} \
+             BMOD=0x{bmod:08x} TMOUT=0x{tmout:08x} CLKSRC=0x{clksrc:08x} UHS=0x{uhs:08x} \
+             CTRL=0x{ctrl:08x}"
+        );
     }
 
     fn can_send_cmd(&self) -> bool {
@@ -278,6 +341,41 @@ impl SdMmc {
         }
     }
 
+    fn idmac_controller_interrupt_mask() -> crate::regs::IntMask {
+        crate::regs::IntMask::new()
+            .with_ebe(true)
+            .with_acd(true)
+            .with_hle(true)
+            .with_frun(true)
+            .with_hto(true)
+            .with_drto(true)
+            .with_rto(true)
+            .with_dcrc(true)
+            .with_rcrc(true)
+            .with_dto(true)
+            .with_re(true)
+    }
+
+    fn idmac_controller_interrupt_mask_matches(mask: crate::regs::IntMask) -> bool {
+        mask.ebe()
+            && mask.acd()
+            // Bit 13 is SBE/Busy Complete depending on controller configuration.
+            // Keep it masked because this driver cannot distinguish the two meanings.
+            && !mask.sbe()
+            && mask.hle()
+            && mask.frun()
+            && mask.hto()
+            && mask.drto()
+            && mask.rto()
+            && mask.dcrc()
+            && mask.rcrc()
+            && mask.dto()
+            && mask.re()
+            && !mask.cmd()
+            && !mask.rxdr()
+            && !mask.txdr()
+    }
+
     fn reset_idmac(&self) -> bool {
         self.regs.bmod().update(|r| r.with_de(false).with_swr(true));
         self.regs
@@ -305,8 +403,47 @@ impl SdMmc {
         }
     }
 
-    fn finish_idmac_transfer(&mut self, context: IdmacTransferContext, recover: bool) -> bool {
-        if recover && !self.reset_idmac() {
+    fn release_dma_buffer(&mut self) {
+        let Some(dma_buffer) = self.dma_buffer.take() else {
+            return;
+        };
+        let Ok(layout) =
+            Layout::from_size_align(dma_buffer.size, self.ahb_data_width.align_value())
+        else {
+            warn!("retaining DMA buffer because its allocation layout is invalid");
+            self.dma_buffer = Some(dma_buffer);
+            return;
+        };
+
+        unsafe { dealloc_coherent(dma_buffer.addr, layout) };
+    }
+
+    fn disable_idmac_after_enable_failure(&mut self) {
+        self.regs.intmask().write(crate::regs::IntMask::new());
+        self.regs.idinten().write(crate::regs::IdIntEn::new());
+        self.regs
+            .ctrl()
+            .update(|r| r.with_int_enable(false).with_use_internal_dmac(false));
+        dma_io_fence();
+
+        if !self.reset_idmac() {
+            warn!("IDMAC enable rollback failed; retaining the DMA buffer");
+            self.idmac_faulted = true;
+            self.idmac_reset_failed = true;
+            return;
+        }
+
+        self.release_dma_buffer();
+    }
+
+    fn finish_idmac_transfer(&mut self, context: IdmacTransferContext, abort: bool) -> SdMmcResult {
+        if abort {
+            self.regs.intmask().write(crate::regs::IntMask::new());
+            self.regs.idinten().write(crate::regs::IdIntEn::new());
+            dma_io_fence();
+        }
+
+        if abort && !self.reset_idmac() {
             warn!("IDMAC recovery failed; retaining the descriptor to avoid DMA use-after-free");
             self.idmac_faulted = true;
             self.idmac_reset_failed = true;
@@ -314,7 +451,7 @@ impl SdMmc {
             let idsts = self.regs.idsts().read();
             self.regs.rintsts().write(rintsts);
             self.regs.idsts().write(idsts);
-            return false;
+            return Err(SdMmcError::RecoveryFailed);
         }
 
         let rintsts = self.regs.rintsts().read();
@@ -324,30 +461,26 @@ impl SdMmc {
         dma_io_fence();
         unsafe { dealloc_coherent(context.dma_desc_info, context.layout) };
 
-        if recover {
-            self.regs
-                .bmod()
-                .update(|r| r.with_de(true).with_dsl(0).with_fb(true));
+        if abort {
             self.regs
                 .ctrl()
-                .update(|r| r.with_use_internal_dmac(true).with_int_enable(true));
-            self.regs.idinten().write(
-                crate::regs::IdIntEn::new()
-                    .with_ai(true)
-                    .with_ni(true)
-                    .with_ces(true)
-                    .with_du(true)
-                    .with_fbe(true)
-                    .with_ri(true)
-                    .with_ti(true),
-            );
-            self.regs
-                .intmask()
-                .update(|r| r.with_acd(true).with_dto(true));
+                .update(|r| r.with_use_internal_dmac(false).with_int_enable(false));
             dma_io_fence();
         }
 
-        true
+        Ok(())
+    }
+
+    fn abort_idmac_transfer(
+        &mut self,
+        context: IdmacTransferContext,
+        error: SdMmcError,
+    ) -> SdMmcError {
+        self.idmac_faulted = true;
+        match self.finish_idmac_transfer(context, true) {
+            Ok(()) => error,
+            Err(recovery_error) => recovery_error,
+        }
     }
 
     fn fifo_cnt(&self) -> usize {
@@ -798,25 +931,21 @@ impl SdMmc {
         info!("SD/MMC driver initialized");
     }
 
-    fn validate_block_buffer(&self, block: u32, len: usize) -> usize {
-        assert!(len != 0, "SD/MMC transfer buffer must not be empty");
-        assert_eq!(
-            len % Self::BLOCK_SIZE,
-            0,
-            "SD/MMC transfer length must be block aligned"
-        );
+    fn validate_block_buffer(&self, block: u32, len: usize) -> SdMmcResult<usize> {
+        if len == 0 || !len.is_multiple_of(Self::BLOCK_SIZE) {
+            return Err(SdMmcError::InvalidParameter);
+        }
         let blocks = len / Self::BLOCK_SIZE;
         let end = (block as u64)
             .checked_add(blocks as u64)
-            .expect("SD/MMC transfer range overflow");
-        assert!(
-            end <= self.num_blocks,
-            "SD/MMC transfer range exceeds card capacity"
-        );
-        blocks
+            .ok_or(SdMmcError::OutOfRange)?;
+        if end > self.num_blocks || end > u32::MAX as u64 + 1 {
+            return Err(SdMmcError::OutOfRange);
+        }
+        Ok(blocks)
     }
 
-    fn read_dma_chunk(&mut self, block: u32, buf: &mut [u8]) {
+    fn read_dma_chunk(&mut self, block: u32, buf: &mut [u8]) -> SdMmcResult {
         debug_assert!(buf.len() <= DMA_BUFFER_SIZE);
         debug_assert!(buf.len().is_multiple_of(Self::BLOCK_SIZE));
         debug_assert!(
@@ -825,27 +954,24 @@ impl SdMmc {
         );
         self.set_transaction_size(Self::BLOCK_SIZE as u16, buf.len() as u32);
 
-        let dma_buf_info = self
-            .dma_buffer
-            .as_ref()
-            .expect("synchronous DMA read requested without an IDMAC buffer");
+        let dma_buf_info = self.dma_buffer.as_ref().ok_or(SdMmcError::DmaUnavailable)?;
         let dma_buf_virt_ptr = dma_buf_info.addr.cpu_addr.as_ptr();
         let dma_bus_addr = u32::try_from(dma_buf_info.addr.bus_addr.as_u64())
-            .expect("DMA buffer address exceeds the IDMAC 32-bit address range");
+            .map_err(|_| SdMmcError::DmaAddress)?;
         let dma_buf = unsafe { core::slice::from_raw_parts_mut(dma_buf_virt_ptr, buf.len()) };
         let command = if buf.len() == Self::BLOCK_SIZE {
             Command::ReadSingleBlock(block, dma_buf)
         } else {
             Command::ReadMultipleBlocks(block, dma_buf)
         };
-        self.send_cmd_idmac(command, dma_bus_addr)
-            .expect("synchronous IDMAC read failed");
+        self.send_cmd_idmac(command, dma_bus_addr)?;
 
         let dma_usr_slice = unsafe { core::slice::from_raw_parts(dma_buf_virt_ptr, buf.len()) };
         buf.copy_from_slice(dma_usr_slice);
+        Ok(())
     }
 
-    async fn read_dma_chunk_async(&mut self, block: u32, buf: &mut [u8]) {
+    async fn read_dma_chunk_async(&mut self, block: u32, buf: &mut [u8]) -> SdMmcResult {
         debug_assert!(buf.len() <= DMA_BUFFER_SIZE);
         debug_assert!(buf.len().is_multiple_of(Self::BLOCK_SIZE));
         debug_assert!(
@@ -854,50 +980,44 @@ impl SdMmc {
         );
         self.set_transaction_size(Self::BLOCK_SIZE as u16, buf.len() as u32);
 
-        let dma_buf_info = self
-            .dma_buffer
-            .as_ref()
-            .expect("asynchronous DMA read requested without an IDMAC buffer");
+        let dma_buf_info = self.dma_buffer.as_ref().ok_or(SdMmcError::DmaUnavailable)?;
         let dma_buf_virt_ptr = dma_buf_info.addr.cpu_addr.as_ptr();
         let dma_bus_addr = u32::try_from(dma_buf_info.addr.bus_addr.as_u64())
-            .expect("DMA buffer address exceeds the IDMAC 32-bit address range");
+            .map_err(|_| SdMmcError::DmaAddress)?;
         let dma_buf = unsafe { core::slice::from_raw_parts_mut(dma_buf_virt_ptr, buf.len()) };
         let command = if buf.len() == Self::BLOCK_SIZE {
             Command::ReadSingleBlock(block, dma_buf)
         } else {
             Command::ReadMultipleBlocks(block, dma_buf)
         };
-        self.send_cmd_idmac_async(command, dma_bus_addr)
-            .await
-            .expect("asynchronous IDMAC read failed");
+        self.send_cmd_idmac_async(command, dma_bus_addr).await?;
 
         let dma_usr_slice = unsafe { core::slice::from_raw_parts(dma_buf_virt_ptr, buf.len()) };
         buf.copy_from_slice(dma_usr_slice);
+        Ok(())
     }
 
-    fn wait_card_ready_after_write(&mut self) {
+    fn wait_card_ready_after_write(&mut self) -> SdMmcResult {
         let deadline = axhal::time::monotonic_time() + Duration::from_secs(5);
         while !self.can_send_data() {
             if axhal::time::monotonic_time() >= deadline {
                 self.idmac_faulted = true;
-                panic!("SD/MMC card stayed busy after write");
+                return Err(SdMmcError::CardBusyTimeout);
             }
             core::hint::spin_loop();
         }
+        Ok(())
     }
 
-    fn write_dma_chunk(&mut self, block: u32, buf: &[u8]) {
+    fn write_dma_chunk(&mut self, block: u32, buf: &[u8]) -> SdMmcResult {
         debug_assert!(buf.len() <= DMA_BUFFER_SIZE);
         debug_assert!(buf.len().is_multiple_of(Self::BLOCK_SIZE));
         self.set_transaction_size(Self::BLOCK_SIZE as u16, buf.len() as u32);
 
-        let dma_buf_info = self
-            .dma_buffer
-            .as_ref()
-            .expect("synchronous DMA write requested without an IDMAC buffer");
+        let dma_buf_info = self.dma_buffer.as_ref().ok_or(SdMmcError::DmaUnavailable)?;
         let dma_buf_virt_ptr = dma_buf_info.addr.cpu_addr.as_ptr();
         let dma_bus_addr = u32::try_from(dma_buf_info.addr.bus_addr.as_u64())
-            .expect("DMA buffer address exceeds the IDMAC 32-bit address range");
+            .map_err(|_| SdMmcError::DmaAddress)?;
         let dma_usr_slice = unsafe { core::slice::from_raw_parts_mut(dma_buf_virt_ptr, buf.len()) };
         dma_usr_slice.copy_from_slice(buf);
 
@@ -907,41 +1027,35 @@ impl SdMmc {
         } else {
             Command::WriteMultipleBlocks(block, dma_buf)
         };
-        self.send_cmd_idmac(command, dma_bus_addr)
-            .expect("synchronous IDMAC write failed");
-        self.wait_card_ready_after_write();
+        self.send_cmd_idmac(command, dma_bus_addr)?;
+        self.wait_card_ready_after_write()
     }
 
-    async fn write_dma_chunk_async(&mut self, block: u32, buf: &[u8]) {
+    async fn write_dma_chunk_async(&mut self, block: u32, buf: &[u8]) -> SdMmcResult {
         debug_assert!(buf.len() <= DMA_BUFFER_SIZE);
         debug_assert!(buf.len().is_multiple_of(Self::BLOCK_SIZE));
         self.set_transaction_size(Self::BLOCK_SIZE as u16, buf.len() as u32);
 
-        let dma_buf_info = self
-            .dma_buffer
-            .as_ref()
-            .expect("asynchronous DMA write requested without an IDMAC buffer");
+        let dma_buf_info = self.dma_buffer.as_ref().ok_or(SdMmcError::DmaUnavailable)?;
         let dma_buf_virt_ptr = dma_buf_info.addr.cpu_addr.as_ptr();
         let dma_usr_slice = unsafe { core::slice::from_raw_parts_mut(dma_buf_virt_ptr, buf.len()) };
         dma_usr_slice.copy_from_slice(buf);
 
         let dma_bus_addr = u32::try_from(dma_buf_info.addr.bus_addr.as_u64())
-            .expect("DMA buffer address exceeds the IDMAC 32-bit address range");
+            .map_err(|_| SdMmcError::DmaAddress)?;
         let dma_buf = unsafe { core::slice::from_raw_parts(dma_buf_virt_ptr, buf.len()) };
         let command = if buf.len() == Self::BLOCK_SIZE {
             Command::WriteSingleBlock(block, dma_buf)
         } else {
             Command::WriteMultipleBlocks(block, dma_buf)
         };
-        self.send_cmd_idmac_async(command, dma_bus_addr)
-            .await
-            .expect("asynchronous IDMAC write failed");
-        self.wait_card_ready_after_write();
+        self.send_cmd_idmac_async(command, dma_bus_addr).await?;
+        self.wait_card_ready_after_write()
     }
 
     /// Reads one or more contiguous blocks from the SD/MMC card.
-    pub fn read_blocks(&mut self, mut block: u32, mut buf: &mut [u8]) {
-        self.validate_block_buffer(block, buf.len());
+    pub fn read_blocks(&mut self, mut block: u32, mut buf: &mut [u8]) -> SdMmcResult {
+        self.validate_block_buffer(block, buf.len())?;
         while !buf.is_empty() {
             let remaining_blocks = buf.len() / Self::BLOCK_SIZE;
             let chunk_blocks = if remaining_blocks >= MIN_MULTI_BLOCK_READ_BLOCKS {
@@ -950,19 +1064,25 @@ impl SdMmc {
                 1
             };
             let (chunk, remaining) = buf.split_at_mut(chunk_blocks * Self::BLOCK_SIZE);
-            self.read_dma_chunk(block, chunk);
+            self.read_dma_chunk(block, chunk)?;
             buf = remaining;
             if !buf.is_empty() {
                 block = block
                     .checked_add(chunk_blocks as u32)
-                    .expect("SD/MMC read block address overflow");
+                    .ok_or(SdMmcError::OutOfRange)?;
             }
         }
+        Ok(())
     }
 
     /// Reads one or more contiguous blocks and asynchronously waits for each DMA chunk.
-    pub async fn read_blocks_async(&mut self, mut block: u32, mut buf: &mut [u8]) {
-        self.validate_block_buffer(block, buf.len());
+    ///
+    /// # Cancellation
+    /// Dropping this future after command submission stops IDMAC and permanently faults the
+    /// driver. This fail-stop policy prevents DMA from accessing a freed descriptor while the
+    /// controller and card terminal states are unknown.
+    pub async fn read_blocks_async(&mut self, mut block: u32, mut buf: &mut [u8]) -> SdMmcResult {
+        self.validate_block_buffer(block, buf.len())?;
         while !buf.is_empty() {
             let remaining_blocks = buf.len() / Self::BLOCK_SIZE;
             let chunk_blocks = if remaining_blocks >= MIN_MULTI_BLOCK_READ_BLOCKS {
@@ -971,66 +1091,77 @@ impl SdMmc {
                 1
             };
             let (chunk, remaining) = buf.split_at_mut(chunk_blocks * Self::BLOCK_SIZE);
-            self.read_dma_chunk_async(block, chunk).await;
+            self.read_dma_chunk_async(block, chunk).await?;
             buf = remaining;
             if !buf.is_empty() {
                 block = block
                     .checked_add(chunk_blocks as u32)
-                    .expect("SD/MMC asynchronous read block address overflow");
+                    .ok_or(SdMmcError::OutOfRange)?;
             }
         }
+        Ok(())
     }
 
     /// Writes one or more contiguous blocks to the SD/MMC card.
-    pub fn write_blocks(&mut self, mut block: u32, mut buf: &[u8]) {
-        self.validate_block_buffer(block, buf.len());
+    pub fn write_blocks(&mut self, mut block: u32, mut buf: &[u8]) -> SdMmcResult {
+        self.validate_block_buffer(block, buf.len())?;
         while !buf.is_empty() {
             let chunk_blocks = (buf.len() / Self::BLOCK_SIZE).min(MAX_DMA_BLOCKS);
             let (chunk, remaining) = buf.split_at(chunk_blocks * Self::BLOCK_SIZE);
-            self.write_dma_chunk(block, chunk);
+            self.write_dma_chunk(block, chunk)?;
             buf = remaining;
             if !buf.is_empty() {
                 block = block
                     .checked_add(chunk_blocks as u32)
-                    .expect("SD/MMC write block address overflow");
+                    .ok_or(SdMmcError::OutOfRange)?;
             }
         }
+        Ok(())
     }
 
     /// Writes one or more contiguous blocks and asynchronously waits for each DMA chunk.
-    pub async fn write_blocks_async(&mut self, mut block: u32, mut buf: &[u8]) {
-        self.validate_block_buffer(block, buf.len());
+    ///
+    /// # Cancellation
+    /// Dropping this future after command submission stops IDMAC and permanently faults the
+    /// driver. The card may still be programming data, so subsequent I/O is deliberately rejected.
+    pub async fn write_blocks_async(&mut self, mut block: u32, mut buf: &[u8]) -> SdMmcResult {
+        self.validate_block_buffer(block, buf.len())?;
         while !buf.is_empty() {
             let chunk_blocks = (buf.len() / Self::BLOCK_SIZE).min(MAX_DMA_BLOCKS);
             let (chunk, remaining) = buf.split_at(chunk_blocks * Self::BLOCK_SIZE);
-            self.write_dma_chunk_async(block, chunk).await;
+            self.write_dma_chunk_async(block, chunk).await?;
             buf = remaining;
             if !buf.is_empty() {
                 block = block
                     .checked_add(chunk_blocks as u32)
-                    .expect("SD/MMC asynchronous write block address overflow");
+                    .ok_or(SdMmcError::OutOfRange)?;
             }
         }
+        Ok(())
     }
 
     /// Reads a single block from the SD/MMC card.
-    pub fn read_block(&mut self, block: u32, buf: &mut [u8; 512]) {
-        self.read_blocks(block, buf);
+    pub fn read_block(&mut self, block: u32, buf: &mut [u8; 512]) -> SdMmcResult {
+        self.read_blocks(block, buf)
     }
 
     /// Reads a single block using IDMAC and asynchronously waits for completion.
-    pub async fn read_block_async(&mut self, block: u32, buf: &mut [u8; 512]) {
-        self.read_blocks_async(block, buf).await;
+    ///
+    /// See [`Self::read_blocks_async`] for the cancellation policy.
+    pub async fn read_block_async(&mut self, block: u32, buf: &mut [u8; 512]) -> SdMmcResult {
+        self.read_blocks_async(block, buf).await
     }
 
     /// Writes a single block to the SD/MMC card.
-    pub fn write_block(&mut self, block: u32, buf: &[u8; 512]) {
-        self.write_blocks(block, buf);
+    pub fn write_block(&mut self, block: u32, buf: &[u8; 512]) -> SdMmcResult {
+        self.write_blocks(block, buf)
     }
 
     /// Writes a single block using IDMAC and asynchronously waits for completion.
-    pub async fn write_block_async(&mut self, block: u32, buf: &[u8; 512]) {
-        self.write_blocks_async(block, buf).await;
+    ///
+    /// See [`Self::write_blocks_async`] for the cancellation policy.
+    pub async fn write_block_async(&mut self, block: u32, buf: &[u8; 512]) -> SdMmcResult {
+        self.write_blocks_async(block, buf).await
     }
 
     /// Returns the number of blocks.
@@ -1045,6 +1176,13 @@ impl SdMmc {
         ahb_data_width: AHBDataWidth,
         register_irq: impl FnOnce() -> bool,
     ) {
+        // Do not inherit interrupt enables from firmware. The handler is
+        // registered below before this driver enables any interrupt source.
+        self.regs.intmask().write(crate::regs::IntMask::new());
+        self.regs.idinten().write(crate::regs::IdIntEn::new());
+        self.regs.ctrl().update(|r| r.with_int_enable(false));
+        dma_io_fence();
+
         let hcon = self.regs.hcon().read();
         let hardware_data_width = match hcon.h_data_width() {
             0 => AHBDataWidth::Bits16,
@@ -1068,11 +1206,15 @@ impl SdMmc {
 
         if !self.reset_idmac() {
             warn!("Failed to reset IDMAC before enabling it");
+            self.idmac_faulted = true;
             return;
         }
 
-        let layout = Layout::from_size_align(buf_size, hardware_data_width.align_value())
-            .expect("Invalid layout for DMA buffer");
+        let Ok(layout) = Layout::from_size_align(buf_size, hardware_data_width.align_value())
+        else {
+            warn!("Invalid DMA buffer layout; IDMAC block transfers are unavailable");
+            return;
+        };
         match unsafe { alloc_coherent(layout) } {
             Ok(dma_info) => {
                 self.dma_buffer = Some(DMABuffer {
@@ -1082,11 +1224,17 @@ impl SdMmc {
             }
             Err(e) => {
                 warn!(
-                    "Failed to allocate DMA buffer: {:?}, use PIO mode instead",
+                    "Failed to allocate DMA buffer: {:?}; IDMAC block transfers are unavailable",
                     e
                 );
                 return;
             }
+        }
+
+        if !register_irq() {
+            warn!("Failed to register IRQ; IDMAC block transfers are unavailable");
+            self.disable_idmac_after_enable_failure();
+            return;
         }
 
         let rintsts_before_enable = self.regs.rintsts().read();
@@ -1124,17 +1272,14 @@ impl SdMmc {
         }
         if !bmod_after.de() || bmod_after.dsl() != 0 || !bmod_after.fb() {
             warn!(
-                "Failed to set BMOD register for IDMAC, use PIO mode instead; actual: de={}, \
-                 dsl={}, fb={}, pbl={}",
+                "Failed to set BMOD register for IDMAC; block transfers are unavailable; actual: \
+                 de={}, dsl={}, fb={}, pbl={}",
                 bmod_after.de(),
                 bmod_after.dsl(),
                 bmod_after.fb(),
                 bmod_after.pbl(),
             );
-            unsafe {
-                dealloc_coherent(self.dma_buffer.as_ref().unwrap().addr, layout);
-            }
-            self.dma_buffer = None;
+            self.disable_idmac_after_enable_failure();
             return;
         }
 
@@ -1146,17 +1291,14 @@ impl SdMmc {
         let idsts_after_ctrl = self.regs.idsts().read();
         if !ctrl_after.use_internal_dmac() || !ctrl_after.int_enable() {
             warn!(
-                "Failed to set CTRL register for IDMAC and interrupt output, use PIO mode \
-                 instead; expected use_internal_dmac=true, int_enable=true. actual: \
+                "Failed to set CTRL register for IDMAC and interrupt output; block transfers are \
+                 unavailable; expected use_internal_dmac=true, int_enable=true. actual: \
                  use_internal_dmac={}, int_enable={}. IDSTS={:?}",
                 ctrl_after.use_internal_dmac(),
                 ctrl_after.int_enable(),
                 idsts_after_ctrl
             );
-            unsafe {
-                dealloc_coherent(self.dma_buffer.as_ref().unwrap().addr, layout);
-            }
-            self.dma_buffer = None;
+            self.disable_idmac_after_enable_failure();
             return;
         }
         if idsts_after_ctrl.du() || idsts_after_ctrl.fbe() || idsts_after_ctrl.ais() {
@@ -1164,14 +1306,13 @@ impl SdMmc {
                 "try_enable_idmac: abnormal IDSTS after CTRL enable; disabling IDMAC path: {:?}",
                 idsts_after_ctrl
             );
-            unsafe {
-                dealloc_coherent(self.dma_buffer.as_ref().unwrap().addr, layout);
-            }
-            self.dma_buffer = None;
+            self.disable_idmac_after_enable_failure();
             return;
         }
 
-        // Enable IDMAC completion/error interrupts and controller ACD/DTO.
+        // Successful command completion is observed together with the terminal
+        // DMA event. Errors are unmasked so both sync and async paths see them
+        // immediately without changing the polling semantics of non-DMA commands.
         self.regs.idinten().write(
             crate::regs::IdIntEn::new()
                 .with_ai(true)
@@ -1184,7 +1325,7 @@ impl SdMmc {
         );
         self.regs
             .intmask()
-            .write(crate::regs::IntMask::new().with_acd(true).with_dto(true));
+            .write(Self::idmac_controller_interrupt_mask());
 
         let idinten_after = self.regs.idinten().read();
         let intmask_after = self.regs.intmask().read();
@@ -1202,20 +1343,11 @@ impl SdMmc {
                  register access"
             );
         }
-        if !intmask_after.acd()
-            || !intmask_after.dto()
-            || intmask_after.cmd()
-            || intmask_after.rxdr()
-            || intmask_after.txdr()
-        {
+        if !Self::idmac_controller_interrupt_mask_matches(intmask_after) {
             warn!(
-                "try_enable_idmac: INTMASK mismatch after write; acd={}, dto={}, cmd={}, rxdr={}, \
-                 txdr={}",
-                intmask_after.acd(),
-                intmask_after.dto(),
-                intmask_after.cmd(),
-                intmask_after.rxdr(),
-                intmask_after.txdr(),
+                "try_enable_idmac: INTMASK mismatch after write; expected=0x{:08x}, actual={:?}",
+                Self::idmac_controller_interrupt_mask().into_bits(),
+                intmask_after,
             );
         }
         if idsts_after_enable.du() || idsts_after_enable.fbe() || idsts_after_enable.ais() {
@@ -1224,29 +1356,34 @@ impl SdMmc {
                 idsts_after_enable
             );
         }
-        let irq_registered = register_irq();
-        if !irq_registered {
-            let idsts_on_irq_fail = self.regs.idsts().read();
-            let idinten_on_irq_fail = self.regs.idinten().read();
-            let rintsts_on_irq_fail = self.regs.rintsts().read();
-            warn!(
-                "Failed to register IRQ for IDMAC, use PIO mode instead; RINTSTS={:?}, \
-                 IDSTS={:?}, IDINTEN={:?}, DBADDR=0x{:08x}",
-                rintsts_on_irq_fail,
-                idsts_on_irq_fail,
-                idinten_on_irq_fail,
-                self.regs.dbaddr().read(),
-            );
-            unsafe {
-                dealloc_coherent(self.dma_buffer.as_ref().unwrap().addr, layout);
-            }
-            self.dma_buffer = None;
+    }
 
-            self.regs.bmod().update(|r| r.with_de(false).with_swr(true));
-            self.regs
-                .ctrl()
-                .update(|r| r.with_dma_reset(true).with_use_internal_dmac(false));
-            return;
+    fn wait_for_transfer_idle_short(&self) -> SdMmcResult {
+        let deadline = axhal::time::monotonic_time() + PRE_SUBMIT_IDLE_SPIN_TIMEOUT;
+        loop {
+            let command_idle = self.can_send_cmd();
+            let data_idle = self.can_send_data();
+            if command_idle && data_idle {
+                return Ok(());
+            }
+            if axhal::time::monotonic_time() >= deadline {
+                warn!(
+                    "IDMAC pre-submit state stayed busy: command_idle={}, data_idle={}, CMD={:?}, \
+                     STATUS={:?}, RINTSTS={:?}, IDSTS={:?}",
+                    command_idle,
+                    data_idle,
+                    self.regs.cmd().read(),
+                    self.regs.status().read(),
+                    self.regs.rintsts().read(),
+                    self.regs.idsts().read(),
+                );
+                return if !command_idle {
+                    Err(SdMmcError::CommandBusy)
+                } else {
+                    Err(SdMmcError::DataBusy)
+                };
+            }
+            core::hint::spin_loop();
         }
     }
 
@@ -1254,54 +1391,19 @@ impl SdMmc {
         &mut self,
         command: Command<'_>,
         dma_bus_addr: u32,
-    ) -> Option<IdmacTransferContext> {
+    ) -> SdMmcResult<IdmacTransferContext> {
         if self.idmac_faulted {
             warn!("refusing IDMAC transfer because the driver is faulted");
-            return None;
+            return Err(SdMmcError::DriverFaulted);
         }
 
         let (cmd, arg, xfer) = command.build();
-        assert!(
-            cmd.data_expected(),
-            "send_cmd_idmac should only be used for commands that require data transfer"
-        );
-        assert!(
-            xfer.is_some(),
-            "send_cmd_idmac requires a data buffer for transfer"
-        );
+        if !cmd.data_expected() {
+            return Err(SdMmcError::InvalidParameter);
+        }
+        let xfer = xfer.ok_or(SdMmcError::InvalidParameter)?;
 
-        let cmd_idle_deadline = axhal::time::monotonic_time() + Duration::from_secs(1);
-        while !self.can_send_cmd() {
-            if axhal::time::monotonic_time() >= cmd_idle_deadline {
-                warn!(
-                    "send_cmd_idmac: can_send_cmd timeout; CMD={:?}, STATUS={:?}, RINTSTS={:?}, \
-                     IDSTS={:?}",
-                    self.regs.cmd().read(),
-                    self.regs.status().read(),
-                    self.regs.rintsts().read(),
-                    self.regs.idsts().read(),
-                );
-                self.idmac_faulted = true;
-                return None;
-            }
-            core::hint::spin_loop();
-        }
-        let data_idle_deadline = axhal::time::monotonic_time() + Duration::from_secs(1);
-        while !self.can_send_data() {
-            if axhal::time::monotonic_time() >= data_idle_deadline {
-                warn!(
-                    "send_cmd_idmac: can_send_data timeout; CMD={:?}, STATUS={:?}, RINTSTS={:?}, \
-                     IDSTS={:?}",
-                    self.regs.cmd().read(),
-                    self.regs.status().read(),
-                    self.regs.rintsts().read(),
-                    self.regs.idsts().read(),
-                );
-                self.idmac_faulted = true;
-                return None;
-            }
-            core::hint::spin_loop();
-        }
+        self.wait_for_transfer_idle_short()?;
 
         // Establish a clean W1C status baseline for the new transaction.
         let stale_rintsts = self.regs.rintsts().read();
@@ -1319,8 +1421,6 @@ impl SdMmc {
             self.clear_idsts();
         }
 
-        let xfer = xfer.unwrap();
-
         IDMAC_DONE_FLAG.store(false, Ordering::Release);
         IDMAC_ERROR_FLAG.store(false, Ordering::Release);
 
@@ -1329,34 +1429,42 @@ impl SdMmc {
             DataXfer::Write(buf) => buf.len(),
         };
 
-        assert!(buf_len != 0, "IDMAC transfer buffer must not be empty");
-        assert!(
-            buf_len <= DMA_BUFFER_SIZE,
-            "IDMAC transfer exceeds the DMA bounce buffer: {buf_len}"
-        );
+        if buf_len == 0 || buf_len > DMA_BUFFER_SIZE {
+            return Err(SdMmcError::InvalidParameter);
+        }
+        if dma_bus_addr.checked_add((buf_len - 1) as u32).is_none() {
+            return Err(SdMmcError::DmaAddress);
+        }
 
         let descriptor_count = buf_len.div_ceil(IDMAC_DESCRIPTOR_BUFFER_SIZE);
         let layout = Layout::array::<IdmacDescriptor>(descriptor_count)
-            .expect("Invalid IDMAC descriptor chain layout");
+            .map_err(|_| SdMmcError::DmaAllocation)?;
         let dma_desc_info =
-            unsafe { alloc_coherent(layout) }.expect("Failed to allocate DMA descriptor");
+            unsafe { alloc_coherent(layout) }.map_err(|_| SdMmcError::DmaAllocation)?;
         let desc_ptr = dma_desc_info.cpu_addr.as_ptr() as *mut IdmacDescriptor;
-        let desc_phy_addr = u32::try_from(dma_desc_info.bus_addr.as_u64())
-            .expect("DMA descriptor address exceeds the IDMAC 32-bit address range");
+        let desc_phy_addr = match u32::try_from(dma_desc_info.bus_addr.as_u64()) {
+            Ok(address) => address,
+            Err(_) => {
+                unsafe { dealloc_coherent(dma_desc_info, layout) };
+                return Err(SdMmcError::DmaAddress);
+            }
+        };
+        let last_descriptor_offset =
+            ((descriptor_count - 1) * core::mem::size_of::<IdmacDescriptor>()) as u32;
+        if desc_phy_addr.checked_add(last_descriptor_offset).is_none() {
+            unsafe { dealloc_coherent(dma_desc_info, layout) };
+            return Err(SdMmcError::DmaAddress);
+        }
 
         for index in 0..descriptor_count {
             let offset = index * IDMAC_DESCRIPTOR_BUFFER_SIZE;
             let segment_len = (buf_len - offset).min(IDMAC_DESCRIPTOR_BUFFER_SIZE);
             let last = index + 1 == descriptor_count;
-            let buffer_addr = dma_bus_addr
-                .checked_add(offset as u32)
-                .expect("DMA data buffer crosses the IDMAC 32-bit address boundary");
+            let buffer_addr = dma_bus_addr + offset as u32;
             let next_descriptor_addr = if last {
                 0
             } else {
-                desc_phy_addr
-                    .checked_add(((index + 1) * core::mem::size_of::<IdmacDescriptor>()) as u32)
-                    .expect("DMA descriptor chain crosses the IDMAC 32-bit address boundary")
+                desc_phy_addr + ((index + 1) * core::mem::size_of::<IdmacDescriptor>()) as u32
             };
 
             let mut descriptor = IdmacDescriptor::new();
@@ -1408,18 +1516,16 @@ impl SdMmc {
                 descriptor_count,
                 owned_descriptors,
             );
-            self.idmac_faulted = true;
-            let _ = self.finish_idmac_transfer(context, true);
-            return None;
+            return Err(self.abort_idmac_transfer(context, SdMmcError::DescriptorPublication));
         }
 
-        Some(context)
+        Ok(context)
     }
 
     fn start_idmac_transfer(
         &mut self,
         mut context: IdmacTransferContext,
-    ) -> Option<IdmacTransferContext> {
+    ) -> SdMmcResult<IdmacTransferContext> {
         let cmd = context.cmd;
         context.generation = IDMAC_COMPLETION.begin_transfer();
 
@@ -1429,7 +1535,7 @@ impl SdMmc {
         dma_io_fence();
 
         let mut start_cmd_wait_count = 0u64;
-        let start_cmd_deadline = axhal::time::monotonic_time() + Duration::from_millis(100);
+        let start_cmd_deadline = axhal::time::monotonic_time() + START_CMD_SPIN_TIMEOUT;
         while self.regs.cmd().read().start_cmd() {
             core::hint::spin_loop();
             start_cmd_wait_count += 1;
@@ -1448,9 +1554,7 @@ impl SdMmc {
                     self.regs.dbaddr().read(),
                     Self::descriptor_owned(&context),
                 );
-                self.idmac_faulted = true;
-                let _ = self.finish_idmac_transfer(context, true);
-                return None;
+                return Err(self.abort_idmac_transfer(context, SdMmcError::CommandStartTimeout));
             }
         }
 
@@ -1469,15 +1573,11 @@ impl SdMmc {
                 "send_cmd_idmac: IDSTS still indicates Descriptor Unavailable after PLDMND; \
                  disabling IDMAC path"
             );
-            self.idmac_faulted = true;
-            let _ = self.finish_idmac_transfer(context, true);
-            return None;
+            return Err(self.abort_idmac_transfer(context, SdMmcError::Hardware));
         }
         if idsts_after_pldmnd.ais() || idsts_after_pldmnd.fbe() {
             warn!("send_cmd_idmac: IDMAC abnormal status after CMD+PLDMND; disabling IDMAC path");
-            self.idmac_faulted = true;
-            let _ = self.finish_idmac_transfer(context, true);
-            return None;
+            return Err(self.abort_idmac_transfer(context, SdMmcError::Hardware));
         }
 
         let fsm = self.regs.idsts().read().fsm();
@@ -1501,7 +1601,7 @@ impl SdMmc {
             );
         }
 
-        Some(context)
+        Ok(context)
     }
 
     fn idmac_completion_status(
@@ -1608,15 +1708,12 @@ impl SdMmc {
         complete
     }
 
-    fn wait_transfer_sync(
-        &self,
-        context: &IdmacTransferContext,
-    ) -> Result<(), IdmacWaitError> {
+    fn wait_transfer_sync(&self, context: &IdmacTransferContext) -> SdMmcResult {
         if context.cmd.response_expect() {
-            let deadline = axhal::time::wall_time() + Duration::from_secs(2);
+            let deadline = axhal::time::monotonic_time() + IDMAC_COMMAND_TIMEOUT;
             while !self.idmac_command_done_or_error(context) {
-                if axhal::time::wall_time() >= deadline {
-                    return Err(IdmacWaitError::CommandTimeout);
+                if axhal::time::monotonic_time() >= deadline {
+                    return Err(SdMmcError::CommandTimeout);
                 }
                 core::hint::spin_loop();
             }
@@ -1624,57 +1721,54 @@ impl SdMmc {
 
         let (rintsts, idsts) = self.idmac_completion_status(context.generation);
         if Self::idmac_status_has_error(&rintsts, &idsts) {
-            return Err(IdmacWaitError::Hardware);
+            return Err(SdMmcError::Hardware);
         }
 
-        let deadline = axhal::time::wall_time() + Duration::from_secs(5);
+        let deadline = axhal::time::monotonic_time() + IDMAC_DATA_WATCHDOG_TIMEOUT;
         while !self.idmac_terminal_events_or_error(context) {
-            if axhal::time::wall_time() >= deadline {
-                return Err(IdmacWaitError::DataTimeout);
+            if axhal::time::monotonic_time() >= deadline {
+                return Err(SdMmcError::DataTimeout);
             }
             core::hint::spin_loop();
         }
 
         let (rintsts, idsts) = self.idmac_completion_status(context.generation);
         if Self::idmac_status_has_error(&rintsts, &idsts) {
-            Err(IdmacWaitError::Hardware)
+            Err(SdMmcError::Hardware)
         } else {
             Ok(())
         }
     }
 
-    async fn wait_transfer_async(
-        &self,
-        context: &IdmacTransferContext,
-    ) -> Result<(), IdmacWaitError> {
+    async fn wait_transfer_async(&self, context: &IdmacTransferContext) -> SdMmcResult {
         if context.cmd.response_expect() {
             let command_timed_out = IDMAC_WAIT_QUEUE
-                .wait_timeout_until_async(Duration::from_secs(2), || {
+                .wait_timeout_until_async(IDMAC_COMMAND_TIMEOUT, || {
                     self.idmac_command_done_or_error(context)
                 })
                 .await;
             if command_timed_out {
-                return Err(IdmacWaitError::CommandTimeout);
+                return Err(SdMmcError::CommandTimeout);
             }
         }
 
         let (rintsts, idsts) = self.idmac_completion_status(context.generation);
         if Self::idmac_status_has_error(&rintsts, &idsts) {
-            return Err(IdmacWaitError::Hardware);
+            return Err(SdMmcError::Hardware);
         }
 
         let data_timed_out = IDMAC_WAIT_QUEUE
-            .wait_timeout_until_async(Duration::from_secs(5), || {
+            .wait_timeout_until_async(IDMAC_DATA_WATCHDOG_TIMEOUT, || {
                 self.idmac_terminal_events_or_error(context)
             })
             .await;
+        let (rintsts, idsts) = self.idmac_completion_status(context.generation);
         if data_timed_out {
-            return Err(IdmacWaitError::DataTimeout);
+            return Err(SdMmcError::DataTimeout);
         }
 
-        let (rintsts, idsts) = self.idmac_completion_status(context.generation);
         if Self::idmac_status_has_error(&rintsts, &idsts) {
-            Err(IdmacWaitError::Hardware)
+            Err(SdMmcError::Hardware)
         } else {
             Ok(())
         }
@@ -1684,7 +1778,7 @@ impl SdMmc {
         &mut self,
         command: Command<'_>,
         dma_bus_addr: u32,
-    ) -> Option<[u32; 4]> {
+    ) -> SdMmcResult<[u32; 4]> {
         let context = self.prepare_idmac_transfer(command, dma_bus_addr)?;
         let context = self.start_idmac_transfer(context)?;
         let mut transfer = ActiveIdmacTransfer::new(self, context);
@@ -1695,56 +1789,60 @@ impl SdMmc {
         );
 
         if let Err(error) = transfer.wait_async().await {
-            warn!(
-                "send_cmd_idmac_async: transfer failed for command index {}: {:?}",
+            let (rintsts, idsts) = transfer.status();
+            log::error!(
+                "SDMMC DMA error outside IRQ: async=true cmd={} error={:?} RINTSTS=0x{:08x} \
+                 IDSTS=0x{:08x}",
                 transfer.context().cmd.cmd_index(),
                 error,
+                rintsts.into_bits(),
+                idsts.into_bits(),
             );
             transfer.fault();
-            let _ = transfer.finish(true);
-            return None;
+            transfer.finish(true)?;
+            return Err(error);
         }
 
         if !transfer.validate() {
             transfer.fault();
-            let _ = transfer.finish(true);
-            return None;
+            transfer.finish(true)?;
+            return Err(SdMmcError::TerminalValidation);
         }
 
         let resp = transfer.response();
-        if !transfer.finish(false) {
-            return None;
-        }
-        Some(resp)
+        transfer.finish(false)?;
+        Ok(resp)
     }
 
-    fn send_cmd_idmac(&mut self, command: Command<'_>, dma_bus_addr: u32) -> Option<[u32; 4]> {
+    fn send_cmd_idmac(&mut self, command: Command<'_>, dma_bus_addr: u32) -> SdMmcResult<[u32; 4]> {
         let context = self.prepare_idmac_transfer(command, dma_bus_addr)?;
         let context = self.start_idmac_transfer(context)?;
         let mut transfer = ActiveIdmacTransfer::new(self, context);
 
         if let Err(error) = transfer.wait_sync() {
-            warn!(
-                "send_cmd_idmac: transfer failed for command index {}: {:?}",
+            let (rintsts, idsts) = transfer.status();
+            log::error!(
+                "SDMMC DMA error outside IRQ: async=false cmd={} error={:?} RINTSTS=0x{:08x} \
+                 IDSTS=0x{:08x}",
                 transfer.context().cmd.cmd_index(),
                 error,
+                rintsts.into_bits(),
+                idsts.into_bits(),
             );
             transfer.fault();
-            let _ = transfer.finish(true);
-            return None;
+            transfer.finish(true)?;
+            return Err(error);
         }
 
         if !transfer.validate() {
             transfer.fault();
-            let _ = transfer.finish(true);
-            return None;
+            transfer.finish(true)?;
+            return Err(SdMmcError::TerminalValidation);
         }
 
         let resp = transfer.response();
-        if !transfer.finish(false) {
-            return None;
-        }
-        Some(resp)
+        transfer.finish(false)?;
+        Ok(resp)
     }
 
     /// The interrupt handler for the IDMAC DMA transfer completion.
@@ -1755,23 +1853,6 @@ impl SdMmc {
             let regs = unsafe { VolatilePtr::new(NonNull::new_unchecked(regs_base as *mut _)) };
             let rintsts = regs.rintsts().read();
             let idsts = regs.idsts().read();
-            let has_rintsts = rintsts.sdio() != 0
-                || rintsts.end_bit_error()
-                || rintsts.auto_command_done()
-                || rintsts.start_bit_error()
-                || rintsts.hardware_locked_write()
-                || rintsts.fifo_under_over_run()
-                || rintsts.host_timeout()
-                || rintsts.data_read_timeout()
-                || rintsts.response_timeout()
-                || rintsts.data_crc_error()
-                || rintsts.response_crc_error()
-                || rintsts.receive_fifo_data_request()
-                || rintsts.transmit_fifo_data_request()
-                || rintsts.data_transfer_over()
-                || rintsts.command_done()
-                || rintsts.response_error()
-                || rintsts.card_detect();
             let has_idsts = idsts.ais()
                 || idsts.nis()
                 || idsts.ces()
@@ -1783,10 +1864,10 @@ impl SdMmc {
                 idsts.ais() || idsts.ces() || idsts.du() || idsts.fbe() || rintsts.error();
             let transfer_done = idsts.ri() || idsts.ti() || rintsts.data_transfer_over();
             let transfer_event = transfer_done || rintsts.auto_command_done();
+            should_notify = transfer_event || idmac_error;
 
             if idmac_error {
                 IDMAC_ERROR_FLAG.store(true, Ordering::Release);
-                log::error!("SDMMC DMA error: RINTSTS={:?}, IDSTS={:?}", rintsts, idsts);
             }
 
             if has_idsts {
@@ -1818,21 +1899,11 @@ impl SdMmc {
             }
 
             IDMAC_COMPLETION.record_irq(rintsts, idsts);
-            should_notify = transfer_event || idmac_error;
-
-            if !has_rintsts && !has_idsts {
-                debug!(
-                    "SDMMC IRQ without pending status: RINTSTS={:?}, IDSTS={:?}",
-                    rintsts, idsts
-                );
-            }
-        } else {
-            warn!("SdMmc::dma_irq_handler: no SDMMC register base available to clear IDSTS");
         }
 
         if should_notify {
             IDMAC_DONE_FLAG.store(true, Ordering::Release);
-            IDMAC_WAIT_QUEUE.notify_one(false);
+            let _waiter_woken = IDMAC_WAIT_QUEUE.notify_one(false);
         }
     }
 
@@ -1854,12 +1925,8 @@ impl Drop for SdMmc {
                 dma_buf.addr.bus_addr.as_u64(),
                 dma_buf.size
             );
-            let layout = Layout::from_size_align(dma_buf.size, self.ahb_data_width.align_value())
-                .expect("Invalid layout for DMA buffer");
-            unsafe {
-                dealloc_coherent(dma_buf.addr, layout);
-            }
         }
+        self.release_dma_buffer();
     }
 }
 

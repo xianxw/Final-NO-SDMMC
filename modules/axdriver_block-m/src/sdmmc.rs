@@ -1,8 +1,8 @@
 //! SD/MMC driver based on SDIO.
 
 use axdriver_base::{BaseDriverOps, DevError, DevResult, DeviceType};
-use log::info;
-use simple_sdmmc::SdMmc;
+use log::error;
+use simple_sdmmc::{SdMmc, SdMmcError};
 
 use crate::BlockDriverOps;
 
@@ -16,15 +16,36 @@ impl SdMmcDriver {
     ///
     /// The caller must ensure that `base` is a valid pointer to the SD/MMC controller's
     /// register block and that no other code is concurrently accessing the same hardware.
-    pub unsafe fn new(base: usize, irq_register: impl FnOnce() -> bool, irq_num: Option<usize>) -> Self {
+    pub unsafe fn new(
+        base: usize,
+        irq_register: impl FnOnce() -> bool,
+        irq_num: Option<usize>,
+    ) -> Self {
         Self(SdMmc::new(base, irq_register), irq_num)
     }
 
     pub fn irq_handler() {
-        info!("SDMMC IRQ handler invoked");
-        info!("SDMMC IRQ handler entering dma_irq_handler");
         SdMmc::dma_irq_handler();
-        info!("SDMMC IRQ handler returned from dma_irq_handler");
+    }
+
+    fn map_error(error: SdMmcError) -> DevError {
+        error!("SD/MMC block operation failed: {error:?}");
+        match error {
+            SdMmcError::InvalidParameter | SdMmcError::OutOfRange => DevError::InvalidParam,
+            SdMmcError::DmaAllocation => DevError::NoMemory,
+            SdMmcError::CommandBusy | SdMmcError::DataBusy => DevError::ResourceBusy,
+            SdMmcError::DmaUnavailable
+            | SdMmcError::DmaAddress
+            | SdMmcError::DriverFaulted
+            | SdMmcError::RecoveryFailed => DevError::BadState,
+            SdMmcError::DescriptorPublication
+            | SdMmcError::CommandStartTimeout
+            | SdMmcError::CommandTimeout
+            | SdMmcError::DataTimeout
+            | SdMmcError::Hardware
+            | SdMmcError::TerminalValidation
+            | SdMmcError::CardBusyTimeout => DevError::Io,
+        }
     }
 }
 
@@ -59,12 +80,16 @@ impl BlockDriverOps for SdMmcDriver {
         let Some(end_block) = block_id.checked_add(block_count) else {
             return Err(DevError::InvalidParam);
         };
-        if block_id > u32::MAX as u64 || end_block > self.0.num_blocks() {
+        if block_id > u32::MAX as u64
+            || end_block > u32::MAX as u64 + 1
+            || end_block > self.0.num_blocks()
+        {
             return Err(DevError::InvalidParam);
         }
 
-        self.0.read_blocks(block_id as u32, buf);
-        Ok(())
+        self.0
+            .read_blocks(block_id as u32, buf)
+            .map_err(Self::map_error)
     }
 
     fn write_block(&mut self, block_id: u64, buf: &[u8]) -> DevResult {
@@ -75,12 +100,16 @@ impl BlockDriverOps for SdMmcDriver {
         let Some(end_block) = block_id.checked_add(block_count) else {
             return Err(DevError::InvalidParam);
         };
-        if block_id > u32::MAX as u64 || end_block > self.0.num_blocks() {
+        if block_id > u32::MAX as u64
+            || end_block > u32::MAX as u64 + 1
+            || end_block > self.0.num_blocks()
+        {
             return Err(DevError::InvalidParam);
         }
 
-        self.0.write_blocks(block_id as u32, buf);
-        Ok(())
+        self.0
+            .write_blocks(block_id as u32, buf)
+            .map_err(Self::map_error)
     }
 
     fn flush(&mut self) -> DevResult {
