@@ -2,6 +2,265 @@ use core::fmt;
 
 use bitfield_struct::bitfield;
 
+/// The card state encoded in an SD R1 response.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum R1CurrentState {
+    /// Card is in the idle state.
+    Idle,
+    /// Card is ready after initialization.
+    Ready,
+    /// Card is in the identification state.
+    Identification,
+    /// Card is in the standby state.
+    Standby,
+    /// Card is ready for data transfer.
+    Transfer,
+    /// Card is sending data.
+    SendingData,
+    /// Card is receiving data.
+    ReceiveData,
+    /// Card is programming received data.
+    Programming,
+    /// Card is disconnected.
+    Disconnect,
+    /// Reserved state value reported by the card.
+    Reserved(u8),
+}
+
+/// Decoded SD card status returned by commands with an R1 or R1b response.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct R1CardStatus(u32);
+
+impl R1CardStatus {
+    /// All R1 bits that make a command unsuccessful for this driver.
+    pub const ERROR_MASK: u32 = 0xfff9_8088;
+
+    /// Creates a card status from the raw 32-bit response.
+    pub const fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    /// Returns the raw 32-bit card status.
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+
+    /// Returns all asserted error bits.
+    pub const fn error_bits(self) -> u32 {
+        self.0 & Self::ERROR_MASK
+    }
+
+    /// Returns whether any R1 error bit is asserted.
+    pub const fn has_error(self) -> bool {
+        self.error_bits() != 0
+    }
+
+    /// Address or block range is outside the card capacity.
+    pub const fn out_of_range(self) -> bool {
+        self.bit(31)
+    }
+
+    /// A command address is not correctly aligned.
+    pub const fn address_error(self) -> bool {
+        self.bit(30)
+    }
+
+    /// The requested block length is invalid.
+    pub const fn block_len_error(self) -> bool {
+        self.bit(29)
+    }
+
+    /// An erase command occurred in an invalid sequence.
+    pub const fn erase_seq_error(self) -> bool {
+        self.bit(28)
+    }
+
+    /// An erase parameter is invalid.
+    pub const fn erase_param(self) -> bool {
+        self.bit(27)
+    }
+
+    /// The command attempted to write protected data.
+    pub const fn wp_violation(self) -> bool {
+        self.bit(26)
+    }
+
+    /// The card is locked.
+    pub const fn card_is_locked(self) -> bool {
+        self.bit(25)
+    }
+
+    /// A lock or unlock operation failed.
+    pub const fn lock_unlock_failed(self) -> bool {
+        self.bit(24)
+    }
+
+    /// The card detected a command CRC error.
+    pub const fn com_crc_error(self) -> bool {
+        self.bit(23)
+    }
+
+    /// The command is illegal for the card state or card type.
+    pub const fn illegal_command(self) -> bool {
+        self.bit(22)
+    }
+
+    /// The card's internal ECC failed.
+    pub const fn card_ecc_failed(self) -> bool {
+        self.bit(21)
+    }
+
+    /// An internal card controller error occurred.
+    pub const fn cc_error(self) -> bool {
+        self.bit(20)
+    }
+
+    /// A general card error occurred.
+    pub const fn error(self) -> bool {
+        self.bit(19)
+    }
+
+    /// CID or CSD overwrite protection was violated.
+    pub const fn cid_csd_overwrite(self) -> bool {
+        self.bit(16)
+    }
+
+    /// A write-protected erase group was skipped.
+    pub const fn wp_erase_skip(self) -> bool {
+        self.bit(15)
+    }
+
+    /// Card internal ECC is disabled.
+    pub const fn card_ecc_disabled(self) -> bool {
+        self.bit(14)
+    }
+
+    /// The card reset its erase sequence before execution.
+    pub const fn erase_reset(self) -> bool {
+        self.bit(13)
+    }
+
+    /// Returns the current card state.
+    pub const fn current_state(self) -> R1CurrentState {
+        match ((self.0 >> 9) & 0xf) as u8 {
+            0 => R1CurrentState::Idle,
+            1 => R1CurrentState::Ready,
+            2 => R1CurrentState::Identification,
+            3 => R1CurrentState::Standby,
+            4 => R1CurrentState::Transfer,
+            5 => R1CurrentState::SendingData,
+            6 => R1CurrentState::ReceiveData,
+            7 => R1CurrentState::Programming,
+            8 => R1CurrentState::Disconnect,
+            state => R1CurrentState::Reserved(state),
+        }
+    }
+
+    /// The card can accept the next data command.
+    pub const fn ready_for_data(self) -> bool {
+        self.bit(8)
+    }
+
+    /// A switch command failed.
+    pub const fn switch_error(self) -> bool {
+        self.bit(7)
+    }
+
+    /// The card is reporting an exception event.
+    pub const fn exception_event(self) -> bool {
+        self.bit(6)
+    }
+
+    /// The preceding CMD55 was accepted and the next command is application-specific.
+    pub const fn app_cmd(self) -> bool {
+        self.bit(5)
+    }
+
+    /// An authentication sequence error occurred.
+    pub const fn ake_seq_error(self) -> bool {
+        self.bit(3)
+    }
+
+    const fn bit(self, bit: u32) -> bool {
+        self.0 & (1 << bit) != 0
+    }
+}
+
+impl fmt::Debug for R1CardStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("R1CardStatus")
+            .field("raw", &format_args!("{:#010x}", self.raw()))
+            .field("error_bits", &format_args!("{:#010x}", self.error_bits()))
+            .field("errors", &R1ErrorNames(*self))
+            .field("current_state", &self.current_state())
+            .field("ready_for_data", &self.ready_for_data())
+            .field("app_cmd", &self.app_cmd())
+            .field("exception_event", &self.exception_event())
+            .finish()
+    }
+}
+
+struct R1ErrorNames(R1CardStatus);
+
+impl fmt::Debug for R1ErrorNames {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let status = self.0;
+        let mut errors = f.debug_list();
+        if status.out_of_range() {
+            errors.entry(&"OUT_OF_RANGE");
+        }
+        if status.address_error() {
+            errors.entry(&"ADDRESS_ERROR");
+        }
+        if status.block_len_error() {
+            errors.entry(&"BLOCK_LEN_ERROR");
+        }
+        if status.erase_seq_error() {
+            errors.entry(&"ERASE_SEQ_ERROR");
+        }
+        if status.erase_param() {
+            errors.entry(&"ERASE_PARAM");
+        }
+        if status.wp_violation() {
+            errors.entry(&"WP_VIOLATION");
+        }
+        if status.card_is_locked() {
+            errors.entry(&"CARD_IS_LOCKED");
+        }
+        if status.lock_unlock_failed() {
+            errors.entry(&"LOCK_UNLOCK_FAILED");
+        }
+        if status.com_crc_error() {
+            errors.entry(&"COM_CRC_ERROR");
+        }
+        if status.illegal_command() {
+            errors.entry(&"ILLEGAL_COMMAND");
+        }
+        if status.card_ecc_failed() {
+            errors.entry(&"CARD_ECC_FAILED");
+        }
+        if status.cc_error() {
+            errors.entry(&"CC_ERROR");
+        }
+        if status.error() {
+            errors.entry(&"ERROR");
+        }
+        if status.cid_csd_overwrite() {
+            errors.entry(&"CID_CSD_OVERWRITE");
+        }
+        if status.wp_erase_skip() {
+            errors.entry(&"WP_ERASE_SKIP");
+        }
+        if status.switch_error() {
+            errors.entry(&"SWITCH_ERROR");
+        }
+        if status.ake_seq_error() {
+            errors.entry(&"AKE_SEQ_ERROR");
+        }
+        errors.finish()
+    }
+}
+
 /// Card Identification
 ///
 /// Reference: https://www.cameramemoryspeed.com/sd-memory-card-faq/reading-sd-card-cid-serial-psn-internal-numbers/

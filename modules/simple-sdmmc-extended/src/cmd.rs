@@ -9,6 +9,7 @@ pub enum Command<'a> {
     SelectCard(u32),            // CMD7
     SendIfCond(u32),            // CMD8
     SendCsd(u32),               // CMD9
+    SendStatus(u32),            // CMD13
     ReadSingleBlock(u32, &'a mut [u8]),    // CMD17
     ReadMultipleBlocks(u32, &'a mut [u8]), // CMD18
     WriteSingleBlock(u32, &'a [u8]),       // CMD24
@@ -29,6 +30,7 @@ impl fmt::Debug for Command<'_> {
             Command::SelectCard(arg) => write!(f, "SelectCard({arg})"),
             Command::SendIfCond(arg) => write!(f, "SendIfCond({arg})"),
             Command::SendCsd(rca) => write!(f, "SendCsd({rca})"),
+            Command::SendStatus(rca) => write!(f, "SendStatus({rca})"),
             Command::ReadSingleBlock(block, _) => write!(f, "ReadSingleBlock({block})"),
             Command::ReadMultipleBlocks(block, _) => write!(f, "ReadMultipleBlocks({block})"),
             Command::WriteSingleBlock(block, _) => write!(f, "WriteSingleBlock({block})"),
@@ -55,6 +57,7 @@ impl<'a> Command<'a> {
             Command::SelectCard(_) => 7,
             Command::SendIfCond(_) => 8,
             Command::SendCsd(_) => 9,
+            Command::SendStatus(_) => 13,
             Command::ReadSingleBlock(..) => 17,
             Command::ReadMultipleBlocks(..) => 18,
             Command::WriteSingleBlock(..) => 24,
@@ -65,6 +68,24 @@ impl<'a> Command<'a> {
 
             Command::ResetClock => 0, // Special case, not a real command
         }
+    }
+
+    pub(crate) fn has_r1_response(&self) -> bool {
+        matches!(
+            self,
+            Command::SelectCard(_)
+                | Command::SendStatus(_)
+                | Command::ReadSingleBlock(..)
+                | Command::ReadMultipleBlocks(..)
+                | Command::WriteSingleBlock(..)
+                | Command::WriteMultipleBlocks(..)
+                | Command::SendScr(_)
+                | Command::AppCmd(_)
+        )
+    }
+
+    pub(crate) fn requires_app_cmd_accepted(&self) -> bool {
+        matches!(self, Command::AppCmd(_))
     }
 
     pub(crate) fn build(self) -> (Cmd, u32, Option<DataXfer<'a>>) {
@@ -82,6 +103,11 @@ impl<'a> Command<'a> {
 
             Command::AllSendCid => (cmd_crc.with_response_length(true), 0, None),
             Command::SendCsd(arg) => (cmd_crc.with_response_length(true), arg, None),
+            Command::SendStatus(arg) => (
+                cmd_crc.with_wait_prvdata_complete(false),
+                arg,
+                None,
+            ),
             Command::SdSendOpCond(arg) => (cmd_resp, arg, None),
 
             Command::ReadSingleBlock(block, buf) => (

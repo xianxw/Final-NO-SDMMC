@@ -3,7 +3,7 @@
 #![allow(unused_imports, dead_code)]
 
 use axdriver_base::DeviceType;
-use log::info;
+use log::{error, info};
 #[cfg(feature = "bus-pci")]
 use axdriver_pci::{DeviceFunction, DeviceFunctionInfo, PciRoot};
 
@@ -118,7 +118,13 @@ cfg_if::cfg_if! {
                         Some(axconfig::devices::SDMMC_IRQ),
                     )
                 };
-                Some(AxDeviceEnum::from_block(sdmmc))
+                match sdmmc {
+                    Ok(sdmmc) => Some(AxDeviceEnum::from_block(sdmmc)),
+                    Err(error) => {
+                        error!("SDMMC initialization failed; block device not registered: {error:?}");
+                        None
+                    }
+                }
             }
         }
     }

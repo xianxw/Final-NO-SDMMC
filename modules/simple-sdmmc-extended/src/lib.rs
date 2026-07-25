@@ -9,3 +9,4 @@ mod utils;
 mod dma;
 
 pub use self::sdmmc::{SdMmc, SdMmcError, SdMmcResult};
+pub use self::utils::{R1CardStatus, R1CurrentState};
