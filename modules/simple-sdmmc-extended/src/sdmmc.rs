@@ -2,6 +2,7 @@ use core::{
     alloc::Layout,
     ptr::NonNull,
     sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
+    task::Poll,
     time::Duration,
 };
 
@@ -13,8 +14,12 @@ use crate::{
     cmd::{Command, DataXfer},
     dma::{DMABuffer, DMAInfo, IdmacDescriptor, alloc_coherent, dealloc_coherent},
     regs::{ClkDiv, ClkEna, RegisterBlock, RegisterBlockVolatileFieldAccess},
-    utils::{Cid, CsdV2},
+    utils::{Cid, CsdV2, R1CardStatus, R1CurrentState},
 };
+
+#[cfg(feature = "async-write-busy-test")]
+#[path = "sdmmc_async_write_busy_test.rs"]
+mod async_write_busy_test;
 
 // VisionFive 2 firmware configures SDIO1 CIU as PLL2 / 3 / 8 = 49.5 MHz.
 // For CLKDIV=n, DW-MMC outputs CIU / (2*n) to the card.
@@ -30,6 +35,7 @@ const START_CMD_SPIN_TIMEOUT: Duration = Duration::from_millis(1);
 const IDMAC_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 // Fallback only: controller TMOUT errors normally wake the waiter through IRQ.
 const IDMAC_DATA_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(5);
+const ASYNC_WRITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn wait_until<F>(mut f: F)
 where
@@ -46,12 +52,15 @@ static IDMAC_ERROR_FLAG: AtomicBool = AtomicBool::new(false);
 static IDMAC_START_LOGGED: AtomicBool = AtomicBool::new(false);
 static SDMMC_REGS_BASE: AtomicUsize = AtomicUsize::new(0);
 static IDMAC_COMPLETION: IdmacCompletion = IdmacCompletion::new();
+static ASYNC_WRITE_BUSY_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
 struct IdmacCompletion {
     generation: AtomicUsize,
     snapshot_generation: AtomicUsize,
     rintsts_bits: AtomicU32,
     idsts_bits: AtomicU32,
+    #[cfg(feature = "async-write-busy-test")]
+    irq_transfer_count: AtomicUsize,
 }
 
 impl IdmacCompletion {
@@ -61,6 +70,8 @@ impl IdmacCompletion {
             snapshot_generation: AtomicUsize::new(0),
             rintsts_bits: AtomicU32::new(0),
             idsts_bits: AtomicU32::new(0),
+            #[cfg(feature = "async-write-busy-test")]
+            irq_transfer_count: AtomicUsize::new(0),
         }
     }
 
@@ -79,10 +90,16 @@ impl IdmacCompletion {
             return;
         }
 
+        #[cfg(feature = "async-write-busy-test")]
+        let first_irq_for_transfer = self.snapshot_generation.load(Ordering::Acquire) != generation;
         self.rintsts_bits
             .fetch_or(rintsts.into_bits(), Ordering::Relaxed);
         self.idsts_bits
             .fetch_or(idsts.into_bits(), Ordering::Relaxed);
+        #[cfg(feature = "async-write-busy-test")]
+        if first_irq_for_transfer {
+            self.irq_transfer_count.fetch_add(1, Ordering::AcqRel);
+        }
         self.snapshot_generation
             .store(generation, Ordering::Release);
     }
@@ -113,9 +130,24 @@ fn dma_io_fence() {
     core::sync::atomic::fence(Ordering::SeqCst);
 }
 
+async fn cooperative_yield_once() {
+    let mut yielded = false;
+    core::future::poll_fn(move |cx| {
+        if yielded {
+            Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    })
+    .await
+}
+
 struct IdmacTransferContext {
     cmd: crate::regs::Cmd,
     arg: u32,
+    expects_r1: bool,
     generation: usize,
     dma_desc_info: DMAInfo,
     layout: Layout,
@@ -123,9 +155,17 @@ struct IdmacTransferContext {
     descriptor_count: usize,
 }
 
-/// Errors returned by SD/MMC block transfers.
+/// Errors returned by SD/MMC initialization and block transfers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SdMmcError {
+    /// Card initialization did not reach a usable transfer state.
+    InitializationFailed,
+    /// The card is outside the supported SDHC/SDXC block-addressed subset.
+    UnsupportedCard,
+    /// The card reported one or more R1 error bits.
+    CardStatus(R1CardStatus),
+    /// CMD55 completed without the APP_CMD acceptance bit.
+    AppCommandRejected(R1CardStatus),
     /// The transfer buffer is empty or is not block aligned.
     InvalidParameter,
     /// The requested block range exceeds the detected card capacity.
@@ -191,6 +231,12 @@ pub struct SdMmc {
     /// Number of blocks on the SD/MMC card, determined during initialization from the CSD register.
     num_blocks: u64,
 
+    /// Relative card address assigned by CMD3.
+    rca: u16,
+
+    /// OCR Card Capacity Status captured from the completed ACMD41 response.
+    ocr_ccs: bool,
+
     /// Indicates whether the Internal DMA (IDMAC) is enabled for data transfer.
     ahb_data_width: AHBDataWidth,
 
@@ -242,6 +288,14 @@ impl<'a> ActiveIdmacTransfer<'a> {
         self.sdmmc.regs.resp().read()
     }
 
+    fn validated_response(&self) -> SdMmcResult<[u32; 4]> {
+        let response = self.response();
+        if self.context().expects_r1 {
+            SdMmc::validate_r1_response(response[0], false)?;
+        }
+        Ok(response)
+    }
+
     fn fault(&mut self) {
         self.sdmmc.idmac_faulted = true;
     }
@@ -268,6 +322,41 @@ impl Drop for ActiveIdmacTransfer<'_> {
     }
 }
 
+struct AsyncWriteBusyGuard<'a> {
+    sdmmc: &'a mut SdMmc,
+    resolved: bool,
+}
+
+impl<'a> AsyncWriteBusyGuard<'a> {
+    fn new(sdmmc: &'a mut SdMmc) -> Self {
+        Self {
+            sdmmc,
+            resolved: false,
+        }
+    }
+
+    fn resolve(&mut self) {
+        self.resolved = true;
+    }
+
+    fn fault(&mut self) {
+        self.sdmmc.idmac_faulted = true;
+        self.resolved = true;
+    }
+}
+
+impl Drop for AsyncWriteBusyGuard<'_> {
+    fn drop(&mut self) {
+        if !self.resolved {
+            warn!(
+                "asynchronous write future dropped while card busy status was unresolved; \
+                 faulting the driver"
+            );
+            self.sdmmc.idmac_faulted = true;
+        }
+    }
+}
+
 impl SdMmc {
     /// The offset of the FIFO register from the base address of the SD/MMC controller's register block.
     const FIFO: usize = 0x200;
@@ -278,22 +367,26 @@ impl SdMmc {
     ///
     /// The caller must ensure that `base` is a valid pointer to the SD/MMC controller's
     /// register block and that no other code is concurrently accessing the same hardware.
-    pub unsafe fn new(base: usize, register_irq: impl FnOnce() -> bool) -> Self {
+    pub unsafe fn new(base: usize, register_irq: impl FnOnce() -> bool) -> SdMmcResult<Self> {
         let regs = unsafe { VolatilePtr::new(NonNull::new_unchecked(base as *mut _)) };
-        SDMMC_REGS_BASE.store(base, Ordering::Release);
 
         let mut this = Self {
             regs,
             num_blocks: 0,
+            rca: 0,
+            ocr_ccs: false,
             ahb_data_width: AHBDataWidth::Bits32,
             dma_buffer: None,
             idmac_faulted: false,
             idmac_reset_failed: false,
         };
         this.log_register_snapshot();
-        this.init();
+        this.init()?;
+        SDMMC_REGS_BASE.store(base, Ordering::Release);
         this.try_enable_idmac(DMA_BUFFER_SIZE, AHBDataWidth::Bits32, register_irq);
-        this
+        #[cfg(feature = "async-write-busy-test")]
+        this.run_async_write_busy_test()?;
+        Ok(this)
     }
 
     fn log_register_snapshot(&self) {
@@ -494,7 +587,7 @@ impl SdMmc {
 
     fn program_card_clock_divider(&self, divider: u8) -> bool {
         self.regs.clkena().write(ClkEna::new());
-        if self.send_cmd(Command::ResetClock).is_none() {
+        if self.send_cmd(Command::ResetClock).is_err() {
             warn!("failed to latch disabled card clock before setting CLKDIV={divider}");
             return false;
         }
@@ -502,13 +595,13 @@ impl SdMmc {
         self.regs
             .clkdiv()
             .write(ClkDiv::new().with_clk_divider0(divider));
-        if self.send_cmd(Command::ResetClock).is_none() {
+        if self.send_cmd(Command::ResetClock).is_err() {
             warn!("failed to latch CLKDIV={divider} while card clock was disabled");
             return false;
         }
 
         self.regs.clkena().write(ClkEna::new().with_cclk_enable(1));
-        if self.send_cmd(Command::ResetClock).is_none() {
+        if self.send_cmd(Command::ResetClock).is_err() {
             warn!("failed to re-enable card clock after setting CLKDIV={divider}");
             return false;
         }
@@ -555,9 +648,30 @@ impl SdMmc {
         false
     }
 
-    fn send_cmd(&self, command: Command<'_>) -> Option<[u32; 4]> {
+    fn validate_r1_response(raw: u32, require_app_cmd: bool) -> SdMmcResult {
+        let status = R1CardStatus::from_raw(raw);
+        if status.has_error() {
+            return Err(SdMmcError::CardStatus(status));
+        }
+        if require_app_cmd && !status.app_cmd() {
+            return Err(SdMmcError::AppCommandRejected(status));
+        }
+        Ok(())
+    }
+
+    fn send_cmd(&self, command: Command<'_>) -> SdMmcResult<[u32; 4]> {
+        self.send_cmd_with_deadline(command, None)
+    }
+
+    fn send_cmd_with_deadline(
+        &self,
+        command: Command<'_>,
+        overall_deadline: Option<Duration>,
+    ) -> SdMmcResult<[u32; 4]> {
         let is_reset_clock = matches!(command, Command::ResetClock);
         let expects_busy = matches!(command, Command::SelectCard(_));
+        let expects_r1 = command.has_r1_response();
+        let requires_app_cmd = command.requires_app_cmd_accepted();
         trace!("send_cmd {command:#x?}");
 
         let (cmd, arg, xfer) = command.build();
@@ -571,7 +685,10 @@ impl SdMmc {
         while !self.can_send_cmd() {
             core::hint::spin_loop();
             cmd_wait_count += 1;
-            if cmd_wait_count > cmd_max_wait {
+            if cmd_wait_count > cmd_max_wait
+                || overall_deadline
+                    .is_some_and(|deadline| axhal::time::monotonic_time() >= deadline)
+            {
                 break;
             }
         }
@@ -584,7 +701,7 @@ impl SdMmc {
                 self.regs.status().read(),
                 self.regs.rintsts().read(),
             );
-            return None;
+            return Err(SdMmcError::CommandBusy);
         }
         if cmd.data_expected() {
             while !self.can_send_data() {
@@ -605,7 +722,10 @@ impl SdMmc {
         while !self.can_send_cmd() {
             core::hint::spin_loop();
             start_cmd_wait_count += 1;
-            if start_cmd_wait_count > cmd_max_wait {
+            if start_cmd_wait_count > cmd_max_wait
+                || overall_deadline
+                    .is_some_and(|deadline| axhal::time::monotonic_time() >= deadline)
+            {
                 break;
             }
         }
@@ -619,7 +739,7 @@ impl SdMmc {
                 self.regs.status().read(),
                 rintsts,
             );
-            return None;
+            return Err(SdMmcError::CommandStartTimeout);
         }
         trace!("cmd {} sent", cmd.cmd_index());
 
@@ -629,7 +749,10 @@ impl SdMmc {
             // setting command_done or an error bit. Clock-update commands are
             // the only exception and complete when start_cmd clears.
             let mut completion_wait_count = 0u64;
-            let completion_deadline = axhal::time::monotonic_time() + Duration::from_secs(1);
+            let command_deadline = axhal::time::monotonic_time() + Duration::from_secs(1);
+            let completion_deadline = overall_deadline
+                .map(|deadline| deadline.min(command_deadline))
+                .unwrap_or(command_deadline);
             while !self.command_finished() {
                 core::hint::spin_loop();
                 completion_wait_count += 1;
@@ -652,7 +775,7 @@ impl SdMmc {
         if command_timed_out {
             let rintsts = self.regs.rintsts().read();
             self.regs.rintsts().write(rintsts);
-            return None;
+            return Err(SdMmcError::CommandTimeout);
         }
 
         let command_status = self.regs.rintsts().read();
@@ -663,12 +786,15 @@ impl SdMmc {
                 "cmd {} failed before data/busy phase: rintsts={command_status:?}, resp={resp:?}",
                 cmd.cmd_index(),
             );
-            return None;
+            return Err(SdMmcError::Hardware);
         }
 
         let mut busy_timed_out = false;
         if expects_busy {
-            let busy_deadline = axhal::time::monotonic_time() + Duration::from_secs(1);
+            let command_deadline = axhal::time::monotonic_time() + Duration::from_secs(1);
+            let busy_deadline = overall_deadline
+                .map(|deadline| deadline.min(command_deadline))
+                .unwrap_or(command_deadline);
             while !self.can_send_data() {
                 if axhal::time::monotonic_time() >= busy_deadline {
                     busy_timed_out = true;
@@ -728,7 +854,7 @@ impl SdMmc {
 
         if busy_timed_out {
             warn!("cmd {} card busy timeout", cmd.cmd_index());
-            return None;
+            return Err(SdMmcError::CardBusyTimeout);
         }
 
         if rintsts.error() {
@@ -752,12 +878,24 @@ impl SdMmc {
                 rintsts.response_error(),
                 rintsts.hardware_locked_write()
             );
-            return None;
+            return if rintsts.data_read_timeout() {
+                Err(SdMmcError::DataTimeout)
+            } else {
+                Err(SdMmcError::Hardware)
+            };
         }
-        Some(resp)
+        if expects_r1 {
+            Self::validate_r1_response(resp[0], requires_app_cmd).inspect_err(|error| {
+                warn!(
+                    "cmd {} returned unsuccessful R1 status: {error:?}",
+                    cmd.cmd_index()
+                );
+            })?;
+        }
+        Ok(resp)
     }
 
-    fn init(&mut self) {
+    fn init(&mut self) -> SdMmcResult {
         info!("Initializing SD/MMC driver at {:?}", self.regs);
 
         // U-Boot leaves the controller configured, but the driver needs a clean status baseline.
@@ -766,16 +904,12 @@ impl SdMmc {
 
         // Reconfigure the card clock while it is disabled.
         self.regs.clkena().write(ClkEna::new());
-        if self.send_cmd(Command::ResetClock).is_none() {
-            warn!("ResetClock failed while disabling card clock; continuing");
-        }
+        self.send_cmd(Command::ResetClock)?;
         self.regs
             .clkdiv()
             .write(ClkDiv::new().with_clk_divider0(IDENTIFICATION_CLOCK_DIVIDER));
         self.regs.clkena().write(ClkEna::new().with_cclk_enable(1));
-        if self.send_cmd(Command::ResetClock).is_none() {
-            warn!("ResetClock failed while enabling card clock; continuing");
-        }
+        self.send_cmd(Command::ResetClock)?;
 
         for _ in 0..10000 {
             core::hint::spin_loop();
@@ -794,53 +928,41 @@ impl SdMmc {
             .ctrl()
             .update(|r| r.with_dma_reset(true).with_use_internal_dmac(false));
 
-        if self.send_cmd(Command::GoIdleState).is_none() {
-            warn!("GoIdleState timed out during initialization; continuing");
-        }
+        self.send_cmd(Command::GoIdleState)?;
 
-        let has_valid_resp = match self.send_cmd(Command::SendIfCond(0x1aa)) {
-            Some(resp) => {
-                if resp[0] & 0xff != 0xaa {
-                    warn!("Unexpected SendIfCond response: {:?}", resp);
-                    false
-                } else {
-                    true
-                }
-            }
-            None => {
-                warn!("SendIfCond FAILED - card not responding or unsupported");
-                false
+        let if_cond = match self.send_cmd(Command::SendIfCond(0x1aa)) {
+            Ok(resp) => resp,
+            Err(error) => {
+                warn!("CMD8 failed; legacy SD v1/SDSC cards are not supported: {error:?}");
+                return Err(SdMmcError::UnsupportedCard);
             }
         };
-
-        if !has_valid_resp {
-            warn!("SD card not responding properly - continuing anyway");
+        if if_cond[0] & 0xfff != 0x1aa {
+            warn!("CMD8 returned an unsupported voltage/check pattern: response={if_cond:?}");
+            return Err(SdMmcError::UnsupportedCard);
         }
 
         let mut attempt = 0;
-        let mut card_initialized = false;
+        let mut ready_ocr = None;
         let acmd41_deadline = axhal::time::monotonic_time() + Duration::from_secs(2);
         while axhal::time::monotonic_time() < acmd41_deadline {
             attempt += 1;
-            if self.send_cmd(Command::AppCmd(0)).is_some() {
+            if self.send_cmd(Command::AppCmd(0)).is_ok() {
                 match self.send_cmd(Command::SdSendOpCond(0x40FF_8000)) {
-                    Some(resp) => {
+                    Ok(resp) => {
                         let ocr = resp[0];
                         if ocr & 0x8000_0000 != 0 {
                             info!(
                                 "SD card is ready after {} attempts, OCR={ocr:#010x}",
                                 attempt
                             );
-                            card_initialized = true;
-                            if ocr & 0x4000_0000 != 0 {
-                                debug!("SD card supports high capacity");
-                            } else {
-                                debug!("SD card is standard capacity");
-                            }
+                            ready_ocr = Some(ocr);
                             break;
                         }
                     }
-                    None => warn!("SdSendOpCond failed on attempt {}", attempt),
+                    Err(error) => {
+                        warn!("SdSendOpCond failed on attempt {}: {error:?}", attempt)
+                    }
                 }
             } else {
                 warn!("AppCmd failed on attempt {}", attempt);
@@ -848,77 +970,74 @@ impl SdMmc {
 
             axhal::time::busy_wait(Duration::from_millis(10));
         }
-        if !card_initialized {
+        let Some(ocr) = ready_ocr else {
             warn!("ACMD41 timed out after {} attempts", attempt);
-        }
-
-        if !card_initialized {
-            warn!("Card initialization failed - continuing anyway");
-            return;
-        }
-
-        match self.send_cmd(Command::AllSendCid) {
-            Some(resp) => {
-                let cid = unsafe { core::mem::transmute::<[u32; 4], Cid>(resp) };
-                info!("cid: {cid:?}");
-            }
-            None => {
-                warn!("AllSendCid failed - cannot determine card ID");
-                return;
-            }
-        }
-
-        let rca = match self.send_cmd(Command::SendRelativeAddr) {
-            Some(resp) => {
-                let rca = (resp[0] >> 16) & 0xffff;
-                debug!("rca: {rca:#x}");
-                rca
-            }
-            None => {
-                warn!("SendRelativeAddr failed - cannot get card address");
-                return;
-            }
+            return Err(SdMmcError::InitializationFailed);
         };
-
-        match self.send_cmd(Command::SendCsd(rca << 16)) {
-            Some(resp) => {
-                let csd = unsafe { core::mem::transmute::<[u32; 4], CsdV2>(resp) };
-                debug!("csd: {csd:?}");
-                self.num_blocks = csd.num_blocks();
-                info!("SD card capacity: {:#x} blocks", self.num_blocks);
-            }
-            None => {
-                warn!("SendCsd failed - cannot determine card capacity");
-                self.num_blocks = 0;
-            }
+        self.ocr_ccs = ocr & 0x4000_0000 != 0;
+        if !self.ocr_ccs {
+            warn!(
+                "ACMD41 reported CCS=0; SDSC byte addressing is not implemented, OCR={ocr:#010x}"
+            );
+            return Err(SdMmcError::UnsupportedCard);
         }
+        debug!("SD card uses high-capacity block addressing");
 
-        if self.send_cmd(Command::SelectCard(rca << 16)).is_none() {
-            warn!("SelectCard failed");
-        }
+        let cid_response = self.send_cmd(Command::AllSendCid)?;
+        let cid = unsafe { core::mem::transmute::<[u32; 4], Cid>(cid_response) };
+        info!("cid: {cid:?}");
 
-        if self.send_cmd(Command::AppCmd(rca << 16)).is_none() {
-            warn!("AppCmd failed");
+        let rca_response = self.send_cmd(Command::SendRelativeAddr)?;
+        let r6_status = rca_response[0] & 0xffff;
+        if r6_status & 0xe000 != 0 {
+            warn!(
+                "CMD3 returned an unsuccessful R6 status: {:#06x}",
+                r6_status
+            );
+            return Err(SdMmcError::InitializationFailed);
         }
+        self.rca = (rca_response[0] >> 16) as u16;
+        if self.rca == 0 {
+            warn!("CMD3 assigned invalid RCA 0");
+            return Err(SdMmcError::InitializationFailed);
+        }
+        debug!("rca: {:#x}", self.rca);
+        let rca_arg = u32::from(self.rca) << 16;
+
+        let csd_response = self.send_cmd(Command::SendCsd(rca_arg))?;
+        let csd = unsafe { core::mem::transmute::<[u32; 4], CsdV2>(csd_response) };
+        debug!("csd: {csd:?}");
+        if csd.csd_structure() != 1 {
+            warn!(
+                "CSD structure {} is unsupported; only SDHC/SDXC CSD v2 is implemented",
+                csd.csd_structure()
+            );
+            return Err(SdMmcError::UnsupportedCard);
+        }
+        self.num_blocks = csd.num_blocks();
+        info!("SD card capacity: {:#x} blocks", self.num_blocks);
+
+        self.send_cmd(Command::SelectCard(rca_arg))?;
+
+        self.send_cmd(Command::AppCmd(rca_arg))?;
 
         // A block-sized buffer keeps the short SCR transfer DMA-aligned.
         self.set_transaction_size(8, 8);
         let mut buf = [0u8; 512];
         match self.send_cmd(Command::SendScr(&mut buf)) {
-            Some(_) => {
+            Ok(_) => {
                 let scr = u64::from_be_bytes(buf[..8].try_into().unwrap());
                 debug!("Bus width supported: {:#x?}", (scr >> 48) & 0xf);
             }
-            None => warn!("SendScr failed"),
+            Err(error) => warn!("SendScr failed: {error:?}"),
         }
 
         let rintsts = self.regs.rintsts().read();
         self.regs.rintsts().write(rintsts);
 
         if !self.switch_card_clock_divider(DEFAULT_SPEED_CLOCK_DIVIDER) {
-            warn!("failed to enter SD Default Speed; disabling block transfers");
-            self.num_blocks = 0;
-            return;
+            warn!("failed to enter SD Default Speed");
+            return Err(SdMmcError::InitializationFailed);
         }
         let card_clock_hz =
             VISIONFIVE2_SDIO_CIU_CLOCK_HZ / (2 * DEFAULT_SPEED_CLOCK_DIVIDER as u32);
@@ -929,6 +1048,7 @@ impl SdMmc {
         );
 
         info!("SD/MMC driver initialized");
+        Ok(())
     }
 
     fn validate_block_buffer(&self, block: u32, len: usize) -> SdMmcResult<usize> {
@@ -1009,6 +1129,108 @@ impl SdMmc {
         Ok(())
     }
 
+    async fn wait_card_ready_after_write_async(&mut self) -> SdMmcResult {
+        let sequence = ASYNC_WRITE_BUSY_SEQUENCE
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        let started_nanos = axhal::time::monotonic_time_nanos();
+        let deadline = axhal::time::monotonic_time() + ASYNC_WRITE_BUSY_TIMEOUT;
+        let rca_arg = u32::from(self.rca) << 16;
+        let mut attempts = 0usize;
+        let mut last_card_status: Option<R1CardStatus> = None;
+        let mut guard = AsyncWriteBusyGuard::new(self);
+
+        loop {
+            if let Some(card_status) = last_card_status
+                && axhal::time::monotonic_time() >= deadline
+            {
+                let wait_us =
+                    axhal::time::monotonic_time_nanos().saturating_sub(started_nanos) / 1_000;
+                let controller_status = guard.sdmmc.regs.status().read();
+                warn!(
+                    "SDMMC_ASYNC_WRITE_BUSY sample={} result=TIMEOUT attempts={} wait_us={} \
+                     r1=0x{:08x} error_bits=0x{:08x} state={:?} ready_for_data={} data_busy={} \
+                     data_state_busy={}",
+                    sequence,
+                    attempts,
+                    wait_us,
+                    card_status.raw(),
+                    card_status.error_bits(),
+                    card_status.current_state(),
+                    card_status.ready_for_data(),
+                    controller_status.data_busy(),
+                    controller_status.data_state_mc_busy(),
+                );
+                guard.fault();
+                return Err(SdMmcError::CardBusyTimeout);
+            }
+
+            attempts = attempts.saturating_add(1);
+            let response = match guard
+                .sdmmc
+                .send_cmd_with_deadline(Command::SendStatus(rca_arg), Some(deadline))
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    let wait_us =
+                        axhal::time::monotonic_time_nanos().saturating_sub(started_nanos) / 1_000;
+                    let controller_status = guard.sdmmc.regs.status().read();
+                    let response = guard.sdmmc.regs.resp().read()[0];
+                    warn!(
+                        "SDMMC_ASYNC_WRITE_BUSY sample={} result=CMD13_ERROR attempts={} \
+                         wait_us={} error={:?} response=0x{:08x} data_busy={} data_state_busy={}",
+                        sequence,
+                        attempts,
+                        wait_us,
+                        error,
+                        response,
+                        controller_status.data_busy(),
+                        controller_status.data_state_mc_busy(),
+                    );
+                    guard.fault();
+                    return Err(error);
+                }
+            };
+
+            let card_status = R1CardStatus::from_raw(response[0]);
+            let controller_status = guard.sdmmc.regs.status().read();
+            let ready = !card_status.has_error()
+                && card_status.ready_for_data()
+                && card_status.current_state() == R1CurrentState::Transfer
+                && !controller_status.data_busy()
+                && !controller_status.data_state_mc_busy();
+            let wait_us = axhal::time::monotonic_time_nanos().saturating_sub(started_nanos) / 1_000;
+
+            if ready {
+                if sequence <= 8 || sequence.is_power_of_two() {
+                    warn!(
+                        "SDMMC_ASYNC_WRITE_BUSY sample={} result=READY attempts={} wait_us={} \
+                         r1=0x{:08x} state={:?} ready_for_data={} data_busy={} data_state_busy={}",
+                        sequence,
+                        attempts,
+                        wait_us,
+                        card_status.raw(),
+                        card_status.current_state(),
+                        card_status.ready_for_data(),
+                        controller_status.data_busy(),
+                        controller_status.data_state_mc_busy(),
+                    );
+                }
+                guard.resolve();
+                return Ok(());
+            }
+
+            // CMD13 is complete before this suspension point. A dropped future
+            // therefore leaves no command or descriptor in flight; the guard
+            // still faults the driver because the card's programming state is
+            // unresolved.
+            last_card_status = Some(card_status);
+            if axhal::time::monotonic_time() < deadline {
+                cooperative_yield_once().await;
+            }
+        }
+    }
+
     fn write_dma_chunk(&mut self, block: u32, buf: &[u8]) -> SdMmcResult {
         debug_assert!(buf.len() <= DMA_BUFFER_SIZE);
         debug_assert!(buf.len().is_multiple_of(Self::BLOCK_SIZE));
@@ -1050,7 +1272,7 @@ impl SdMmc {
             Command::WriteMultipleBlocks(block, dma_buf)
         };
         self.send_cmd_idmac_async(command, dma_bus_addr).await?;
-        self.wait_card_ready_after_write()
+        self.wait_card_ready_after_write_async().await
     }
 
     /// Reads one or more contiguous blocks from the SD/MMC card.
@@ -1122,8 +1344,9 @@ impl SdMmc {
     /// Writes one or more contiguous blocks and asynchronously waits for each DMA chunk.
     ///
     /// # Cancellation
-    /// Dropping this future after command submission stops IDMAC and permanently faults the
-    /// driver. The card may still be programming data, so subsequent I/O is deliberately rejected.
+    /// Dropping this future while IDMAC is active stops IDMAC before freeing its descriptor.
+    /// Dropping it after DMA completion but before CMD13 reports the card ready leaves no command
+    /// in flight, but still permanently faults the driver because card programming is unresolved.
     pub async fn write_blocks_async(&mut self, mut block: u32, mut buf: &[u8]) -> SdMmcResult {
         self.validate_block_buffer(block, buf.len())?;
         while !buf.is_empty() {
@@ -1167,6 +1390,19 @@ impl SdMmc {
     /// Returns the number of blocks.
     pub fn num_blocks(&self) -> u64 {
         self.num_blocks
+    }
+
+    /// Returns the relative card address assigned by CMD3.
+    pub fn relative_card_address(&self) -> u16 {
+        self.rca
+    }
+
+    /// Returns the OCR Card Capacity Status captured from ACMD41.
+    ///
+    /// This driver only completes initialization when this is `true`; SDSC
+    /// byte-addressed cards are intentionally unsupported.
+    pub fn is_high_capacity(&self) -> bool {
+        self.ocr_ccs
     }
 
     /// Enables the Internal DMA (IDMAC) for DMA transfers.
@@ -1350,6 +1586,12 @@ impl SdMmc {
                 intmask_after,
             );
         }
+        warn!(
+            "SDMMC_ASYNC_WRITE_BUSY configured: policy=CMD13 rca=0x{:04x} \
+             wait_prvdata_complete=false timeout_ms={} yield=cooperative",
+            self.rca,
+            ASYNC_WRITE_BUSY_TIMEOUT.as_millis(),
+        );
         if idsts_after_enable.du() || idsts_after_enable.fbe() || idsts_after_enable.ais() {
             warn!(
                 "try_enable_idmac: abnormal post-enable IDSTS detected: {:?}",
@@ -1397,6 +1639,7 @@ impl SdMmc {
             return Err(SdMmcError::DriverFaulted);
         }
 
+        let expects_r1 = command.has_r1_response();
         let (cmd, arg, xfer) = command.build();
         if !cmd.data_expected() {
             return Err(SdMmcError::InvalidParameter);
@@ -1491,6 +1734,7 @@ impl SdMmc {
         let context = IdmacTransferContext {
             cmd,
             arg,
+            expects_r1,
             generation: 0,
             dma_desc_info,
             layout,
@@ -1809,7 +2053,18 @@ impl SdMmc {
             return Err(SdMmcError::TerminalValidation);
         }
 
-        let resp = transfer.response();
+        let resp = match transfer.validated_response() {
+            Ok(response) => response,
+            Err(error) => {
+                warn!(
+                    "async IDMAC cmd {} returned unsuccessful R1 status: {error:?}",
+                    transfer.context().cmd.cmd_index()
+                );
+                transfer.fault();
+                transfer.finish(true)?;
+                return Err(error);
+            }
+        };
         transfer.finish(false)?;
         Ok(resp)
     }
@@ -1840,7 +2095,18 @@ impl SdMmc {
             return Err(SdMmcError::TerminalValidation);
         }
 
-        let resp = transfer.response();
+        let resp = match transfer.validated_response() {
+            Ok(response) => response,
+            Err(error) => {
+                warn!(
+                    "synchronous IDMAC cmd {} returned unsuccessful R1 status: {error:?}",
+                    transfer.context().cmd.cmd_index()
+                );
+                transfer.fault();
+                transfer.finish(true)?;
+                return Err(error);
+            }
+        };
         transfer.finish(false)?;
         Ok(resp)
     }
@@ -1897,6 +2163,7 @@ impl SdMmc {
                     .with_transmit_fifo_data_request(rintsts.transmit_fifo_data_request());
                 regs.rintsts().write(clear_rintsts);
             }
+            dma_io_fence();
 
             IDMAC_COMPLETION.record_irq(rintsts, idsts);
         }

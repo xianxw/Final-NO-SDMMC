@@ -20,8 +20,8 @@ impl SdMmcDriver {
         base: usize,
         irq_register: impl FnOnce() -> bool,
         irq_num: Option<usize>,
-    ) -> Self {
-        Self(SdMmc::new(base, irq_register), irq_num)
+    ) -> Result<Self, SdMmcError> {
+        Ok(Self(unsafe { SdMmc::new(base, irq_register) }?, irq_num))
     }
 
     pub fn irq_handler() {
@@ -31,6 +31,7 @@ impl SdMmcDriver {
     fn map_error(error: SdMmcError) -> DevError {
         error!("SD/MMC block operation failed: {error:?}");
         match error {
+            SdMmcError::UnsupportedCard => DevError::Unsupported,
             SdMmcError::InvalidParameter | SdMmcError::OutOfRange => DevError::InvalidParam,
             SdMmcError::DmaAllocation => DevError::NoMemory,
             SdMmcError::CommandBusy | SdMmcError::DataBusy => DevError::ResourceBusy,
@@ -39,6 +40,9 @@ impl SdMmcDriver {
             | SdMmcError::DriverFaulted
             | SdMmcError::RecoveryFailed => DevError::BadState,
             SdMmcError::DescriptorPublication
+            | SdMmcError::InitializationFailed
+            | SdMmcError::CardStatus(_)
+            | SdMmcError::AppCommandRejected(_)
             | SdMmcError::CommandStartTimeout
             | SdMmcError::CommandTimeout
             | SdMmcError::DataTimeout

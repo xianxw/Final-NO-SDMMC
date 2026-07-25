@@ -73,6 +73,7 @@ plat-dyn = [
     "paging",
 ]
 rtc = []
+sdmmc-async-write-busy-test = []
 smp = [
     "axhal/smp",
     "axtask?/smp",

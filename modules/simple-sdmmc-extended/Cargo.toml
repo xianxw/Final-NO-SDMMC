@@ -7,6 +7,10 @@ authors = ["朝倉水希 <asakuramizu111@gmail.com>"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Starry-OS/simple-sdmmc"
 
+[features]
+default = []
+async-write-busy-test = []
+
 [dependencies]
 # axdma = { workspace = true }
 # axtask = { workspace = true, features = ["multitask"] }

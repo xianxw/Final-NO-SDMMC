@@ -59,4 +59,14 @@ vf2:
 		MYPLAT=axplat-riscv64-visionfive2 BUS=mmio \
 		TARGET_DIR=$(PWD)/target/vf2 build
 
-.PHONY: build run justrun debug disasm clean
+vf2-busy-test:
+	$(MAKE) ARCH=riscv64 APP_FEATURES="vf2 sdmmc-async-write-busy-test" \
+		MYPLAT=axplat-riscv64-visionfive2 BUS=mmio \
+		TARGET_DIR=$(PWD)/target/vf2-busy-test \
+		OUT_DIR=$(PWD)/target/vf2-busy-test-image build
+	cp $(PWD)/target/vf2-busy-test-image/Final-NO-SDMMC_visionfive2.elf \
+		$(PWD)/Final-NO-SDMMC_visionfive2_async_write_busy_test.elf
+	cp $(PWD)/target/vf2-busy-test-image/Final-NO-SDMMC_visionfive2.bin \
+		$(PWD)/Final-NO-SDMMC_visionfive2_async_write_busy_test.bin
+
+.PHONY: build run justrun debug disasm clean vf2 vf2-busy-test

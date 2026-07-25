@@ -33,6 +33,12 @@
 #![cfg_attr(not(test), no_std)]
 #![allow(missing_abi)]
 
+#[cfg(all(
+    feature = "sdmmc-async-write-busy-test",
+    not(all(feature = "axdriver", feature = "irq", feature = "multitask"))
+))]
+compile_error!("sdmmc-async-write-busy-test requires axdriver, irq, and multitask");
+
 #[macro_use]
 extern crate axlog;
 
@@ -216,6 +222,15 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
     #[cfg(feature = "multitask")]
     axtask::init_scheduler();
 
+    // The dedicated async SDMMC test runs during driver construction, before the
+    // filesystem takes ownership of the device. It needs both the device IRQ and
+    // timer wakeups; production builds retain the established later IRQ init point.
+    #[cfg(all(feature = "irq", feature = "sdmmc-async-write-busy-test"))]
+    {
+        warn!("Initialize interrupt handlers before SDMMC async-write test...");
+        init_interrupt();
+    }
+
     #[cfg(feature = "axdriver")]
     {
         #[allow(unused_variables)]
@@ -251,7 +266,7 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
     #[cfg(feature = "smp")]
     self::mp::start_secondary_cpus(cpu_id);
 
-    #[cfg(feature = "irq")]
+    #[cfg(all(feature = "irq", not(feature = "sdmmc-async-write-busy-test")))]
     {
         info!("Initialize interrupt handlers...");
         init_interrupt();
