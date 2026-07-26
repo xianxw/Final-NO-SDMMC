@@ -2,6 +2,9 @@
 #![no_std]
 #![warn(missing_docs)]
 
+#[cfg(feature = "sdmmc-concurrency-test")]
+extern crate alloc;
+
 mod cmd;
 mod regs;
 mod sdmmc;

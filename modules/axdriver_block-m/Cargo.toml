@@ -47,6 +47,10 @@ bcm2835-sdhci = ["dep:bcm2835-sdhci"]
 ramdisk = []
 ramdisk-static = []
 sdmmc = ["dep:simple-sdmmc"]
+sdmmc-concurrency-test = [
+    "sdmmc",
+    "simple-sdmmc/sdmmc-concurrency-test",
+]
 
 [lib]
 name = "axdriver_block"

@@ -17,6 +17,10 @@ use crate::{
     utils::{Cid, CsdV2, R1CardStatus, R1CurrentState},
 };
 
+#[cfg(feature = "sdmmc-concurrency-test")]
+#[path = "sdmmc_concurrency_test.rs"]
+mod concurrency_test;
+
 // VisionFive 2 firmware configures SDIO1 CIU as PLL2 / 3 / 8 = 49.5 MHz.
 // For CLKDIV=n, DW-MMC outputs CIU / (2*n) to the card.
 const VISIONFIVE2_SDIO_CIU_CLOCK_HZ: u32 = 49_500_000;
@@ -74,6 +78,11 @@ impl IdmacCompletion {
         self.generation
             .fetch_add(1, Ordering::AcqRel)
             .wrapping_add(1)
+    }
+
+    #[cfg(feature = "sdmmc-concurrency-test")]
+    fn current_generation(&self) -> usize {
+        self.generation.load(Ordering::Acquire)
     }
 
     fn record_irq(&self, rintsts: crate::regs::RIntSts, idsts: crate::regs::IdSts) {
@@ -1756,6 +1765,10 @@ impl SdMmc {
     ) -> SdMmcResult<IdmacTransferContext> {
         let cmd = context.cmd;
         context.generation = IDMAC_COMPLETION.begin_transfer();
+        #[cfg(feature = "sdmmc-concurrency-test")]
+        if concurrency_test::observation_enabled() {
+            concurrency_test::begin_transfer_observation(context.generation);
+        }
 
         self.regs.cmdarg().write(context.arg);
         dma_io_fence();
@@ -1970,11 +1983,19 @@ impl SdMmc {
 
     async fn wait_transfer_async(&self, context: &IdmacTransferContext) -> SdMmcResult {
         if context.cmd.response_expect() {
+            #[cfg(feature = "sdmmc-concurrency-test")]
+            let command_wait_started_ns = axhal::time::monotonic_time_nanos();
             let command_timed_out = IDMAC_WAIT_QUEUE
                 .wait_timeout_until_async(IDMAC_COMMAND_TIMEOUT, || {
                     self.idmac_command_done_or_error(context)
                 })
                 .await;
+            #[cfg(feature = "sdmmc-concurrency-test")]
+            concurrency_test::record_async_command_wait(
+                context.generation,
+                command_timed_out,
+                axhal::time::monotonic_time_nanos().saturating_sub(command_wait_started_ns),
+            );
             if command_timed_out {
                 return Err(SdMmcError::CommandTimeout);
             }
@@ -1985,12 +2006,22 @@ impl SdMmc {
             return Err(SdMmcError::Hardware);
         }
 
+        #[cfg(feature = "sdmmc-concurrency-test")]
+        let data_wait_started_ns = axhal::time::monotonic_time_nanos();
         let data_timed_out = IDMAC_WAIT_QUEUE
             .wait_timeout_until_async(IDMAC_DATA_WATCHDOG_TIMEOUT, || {
                 self.idmac_terminal_events_or_error(context)
             })
             .await;
         let (rintsts, idsts) = self.idmac_completion_status(context.generation);
+        #[cfg(feature = "sdmmc-concurrency-test")]
+        concurrency_test::record_async_resume(
+            context.generation,
+            data_timed_out,
+            axhal::time::monotonic_time_nanos().saturating_sub(data_wait_started_ns),
+            rintsts,
+            idsts,
+        );
         if data_timed_out {
             return Err(SdMmcError::DataTimeout);
         }
@@ -2099,6 +2130,10 @@ impl SdMmc {
     pub fn dma_irq_handler() {
         let regs_base = SDMMC_REGS_BASE.load(Ordering::Acquire);
         let mut should_notify = false;
+        #[cfg(feature = "sdmmc-concurrency-test")]
+        let observe_irq = concurrency_test::observation_enabled();
+        #[cfg(feature = "sdmmc-concurrency-test")]
+        let irq_entry_ns = observe_irq.then(axhal::time::monotonic_time_nanos);
         if regs_base != 0 {
             let regs = unsafe { VolatilePtr::new(NonNull::new_unchecked(regs_base as *mut _)) };
             let rintsts = regs.rintsts().read();
@@ -2153,6 +2188,14 @@ impl SdMmc {
         }
 
         if should_notify {
+            #[cfg(feature = "sdmmc-concurrency-test")]
+            if let Some(irq_entry_ns) = irq_entry_ns {
+                concurrency_test::record_irq_wake(
+                    IDMAC_COMPLETION.current_generation(),
+                    irq_entry_ns,
+                    axhal::time::monotonic_time_nanos(),
+                );
+            }
             IDMAC_DONE_FLAG.store(true, Ordering::Release);
             let _waiter_woken = IDMAC_WAIT_QUEUE.notify_one(false);
         }

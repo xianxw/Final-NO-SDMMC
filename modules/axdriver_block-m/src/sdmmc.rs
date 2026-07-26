@@ -28,6 +28,11 @@ impl SdMmcDriver {
         SdMmc::dma_irq_handler();
     }
 
+    #[cfg(feature = "sdmmc-concurrency-test")]
+    pub fn run_concurrency_test(&mut self) -> ! {
+        self.0.run_concurrency_test()
+    }
+
     fn map_error(error: SdMmcError) -> DevError {
         error!("SD/MMC block operation failed: {error:?}");
         match error {

@@ -59,4 +59,14 @@ vf2:
 		MYPLAT=axplat-riscv64-visionfive2 BUS=mmio \
 		TARGET_DIR=$(PWD)/target/vf2 build
 
-.PHONY: build run justrun debug disasm clean
+vf2-concurrency-test:
+	$(MAKE) ARCH=riscv64 APP_FEATURES="vf2 sdmmc-concurrency-test" \
+		MYPLAT=axplat-riscv64-visionfive2 BUS=mmio \
+		TARGET_DIR=$(PWD)/target/vf2-concurrency-test \
+		OUT_DIR=$(PWD)/target/vf2-concurrency-test-image build
+	cp $(PWD)/target/vf2-concurrency-test-image/Final-NO-SDMMC_visionfive2.elf \
+		$(PWD)/Final-NO-SDMMC_visionfive2_concurrency_test.elf
+	cp $(PWD)/target/vf2-concurrency-test-image/Final-NO-SDMMC_visionfive2.bin \
+		$(PWD)/Final-NO-SDMMC_visionfive2_concurrency_test.bin
+
+.PHONY: build run justrun debug disasm clean vf2 vf2-concurrency-test

@@ -77,6 +77,12 @@ smp = [
     "axhal/smp",
     "axtask?/smp",
 ]
+sdmmc-concurrency-test = [
+    "axdriver",
+    "irq",
+    "multitask",
+    "axdriver/sdmmc-concurrency-test",
+]
 tls = [
     "axhal/tls",
     "axtask?/tls",

@@ -86,6 +86,10 @@ sdmmc = [
     "dep:axhal",
     "dep:axconfig",
 ]
+sdmmc-concurrency-test = [
+    "sdmmc",
+    "axdriver_block/sdmmc-concurrency-test",
+]
 virtio = [
     "dep:axdriver_virtio",
     "dep:axalloc",
