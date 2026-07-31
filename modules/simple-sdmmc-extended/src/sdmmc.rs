@@ -523,6 +523,10 @@ impl SdMmc {
     }
 
     fn finish_idmac_transfer(&mut self, context: IdmacTransferContext, abort: bool) -> SdMmcResult {
+        #[cfg(feature = "sdmmc-concurrency-test")]
+        let stage_generation = context.generation;
+        #[cfg(feature = "sdmmc-concurrency-test")]
+        concurrency_test::record_stage_cleanup_start(stage_generation);
         if abort {
             self.regs.intmask().write(crate::regs::IntMask::new());
             self.regs.idinten().write(crate::regs::IdIntEn::new());
@@ -553,6 +557,9 @@ impl SdMmc {
                 .update(|r| r.with_use_internal_dmac(false).with_int_enable(false));
             dma_io_fence();
         }
+
+        #[cfg(feature = "sdmmc-concurrency-test")]
+        concurrency_test::record_stage_cleanup_end(stage_generation);
 
         Ok(())
     }
@@ -1639,6 +1646,9 @@ impl SdMmc {
         }
         let xfer = xfer.ok_or(SdMmcError::InvalidParameter)?;
 
+        #[cfg(feature = "sdmmc-concurrency-test")]
+        concurrency_test::record_stage_prepare_start();
+
         self.wait_for_transfer_idle_short()?;
 
         // Establish a clean W1C status baseline for the new transaction.
@@ -1756,6 +1766,9 @@ impl SdMmc {
             return Err(self.abort_idmac_transfer(context, SdMmcError::DescriptorPublication));
         }
 
+        #[cfg(feature = "sdmmc-concurrency-test")]
+        concurrency_test::record_stage_prepare_end();
+
         Ok(context)
     }
 
@@ -1766,12 +1779,17 @@ impl SdMmc {
         let cmd = context.cmd;
         context.generation = IDMAC_COMPLETION.begin_transfer();
         #[cfg(feature = "sdmmc-concurrency-test")]
-        if concurrency_test::observation_enabled() {
-            concurrency_test::begin_transfer_observation(context.generation);
+        {
+            concurrency_test::record_stage_generation(context.generation);
+            if concurrency_test::observation_enabled() {
+                concurrency_test::begin_transfer_observation(context.generation);
+            }
         }
 
         self.regs.cmdarg().write(context.arg);
         dma_io_fence();
+        #[cfg(feature = "sdmmc-concurrency-test")]
+        concurrency_test::record_stage_cmd_write(context.generation);
         self.regs.cmd().write(cmd);
         dma_io_fence();
 
@@ -1841,6 +1859,9 @@ impl SdMmc {
                 dbaddr,
             );
         }
+
+        #[cfg(feature = "sdmmc-concurrency-test")]
+        concurrency_test::record_stage_submit_end(context.generation);
 
         Ok(context)
     }
@@ -1960,6 +1981,9 @@ impl SdMmc {
             }
         }
 
+        #[cfg(feature = "sdmmc-concurrency-test")]
+        concurrency_test::record_stage_command_seen(context.generation);
+
         let (rintsts, idsts) = self.idmac_completion_status(context.generation);
         if Self::idmac_status_has_error(&rintsts, &idsts) {
             return Err(SdMmcError::Hardware);
@@ -1972,6 +1996,9 @@ impl SdMmc {
             }
             core::hint::spin_loop();
         }
+
+        #[cfg(feature = "sdmmc-concurrency-test")]
+        concurrency_test::record_stage_terminal_seen(context.generation);
 
         let (rintsts, idsts) = self.idmac_completion_status(context.generation);
         if Self::idmac_status_has_error(&rintsts, &idsts) {
@@ -2001,6 +2028,9 @@ impl SdMmc {
             }
         }
 
+        #[cfg(feature = "sdmmc-concurrency-test")]
+        concurrency_test::record_stage_command_seen(context.generation);
+
         let (rintsts, idsts) = self.idmac_completion_status(context.generation);
         if Self::idmac_status_has_error(&rintsts, &idsts) {
             return Err(SdMmcError::Hardware);
@@ -2025,6 +2055,9 @@ impl SdMmc {
         if data_timed_out {
             return Err(SdMmcError::DataTimeout);
         }
+
+        #[cfg(feature = "sdmmc-concurrency-test")]
+        concurrency_test::record_stage_terminal_seen(context.generation);
 
         if Self::idmac_status_has_error(&rintsts, &idsts) {
             Err(SdMmcError::Hardware)
@@ -2080,6 +2113,8 @@ impl SdMmc {
                 return Err(error);
             }
         };
+        #[cfg(feature = "sdmmc-concurrency-test")]
+        concurrency_test::record_stage_validation_end(transfer.context().generation);
         transfer.finish(false)?;
         Ok(resp)
     }
@@ -2122,6 +2157,8 @@ impl SdMmc {
                 return Err(error);
             }
         };
+        #[cfg(feature = "sdmmc-concurrency-test")]
+        concurrency_test::record_stage_validation_end(transfer.context().generation);
         transfer.finish(false)?;
         Ok(resp)
     }
@@ -2131,9 +2168,12 @@ impl SdMmc {
         let regs_base = SDMMC_REGS_BASE.load(Ordering::Acquire);
         let mut should_notify = false;
         #[cfg(feature = "sdmmc-concurrency-test")]
-        let observe_irq = concurrency_test::observation_enabled();
+        let observe_async_irq = concurrency_test::observation_enabled();
         #[cfg(feature = "sdmmc-concurrency-test")]
-        let irq_entry_ns = observe_irq.then(axhal::time::monotonic_time_nanos);
+        let observe_stage_irq = concurrency_test::stage_observation_enabled();
+        #[cfg(feature = "sdmmc-concurrency-test")]
+        let irq_entry_ns = (observe_async_irq || observe_stage_irq)
+            .then(axhal::time::monotonic_time_nanos);
         if regs_base != 0 {
             let regs = unsafe { VolatilePtr::new(NonNull::new_unchecked(regs_base as *mut _)) };
             let rintsts = regs.rintsts().read();
@@ -2150,6 +2190,18 @@ impl SdMmc {
             let transfer_done = idsts.ri() || idsts.ti() || rintsts.data_transfer_over();
             let transfer_event = transfer_done || rintsts.auto_command_done();
             should_notify = transfer_event || idmac_error;
+
+            #[cfg(feature = "sdmmc-concurrency-test")]
+            if observe_stage_irq
+                && let Some(irq_entry_ns) = irq_entry_ns
+            {
+                concurrency_test::record_stage_irq(
+                    IDMAC_COMPLETION.current_generation(),
+                    irq_entry_ns,
+                    rintsts.into_bits(),
+                    idsts.into_bits(),
+                );
+            }
 
             if idmac_error {
                 IDMAC_ERROR_FLAG.store(true, Ordering::Release);
@@ -2189,7 +2241,9 @@ impl SdMmc {
 
         if should_notify {
             #[cfg(feature = "sdmmc-concurrency-test")]
-            if let Some(irq_entry_ns) = irq_entry_ns {
+            if observe_async_irq
+                && let Some(irq_entry_ns) = irq_entry_ns
+            {
                 concurrency_test::record_irq_wake(
                     IDMAC_COMPLETION.current_generation(),
                     irq_entry_ns,

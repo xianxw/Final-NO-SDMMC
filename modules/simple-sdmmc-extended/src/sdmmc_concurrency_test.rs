@@ -15,6 +15,8 @@ use super::*;
 const TEST_START_LBA: u32 = 2_099_200;
 const TEST_ROUNDS: usize = 5;
 const LEGACY_CONTROL_BLOCKS: usize = 256;
+const RANGE_DIAGNOSTIC_WIDE_BLOCKS: usize = 2 * 1024 * 1024 / SdMmc::BLOCK_SIZE;
+const RANGE_DIAGNOSTIC_REQUEST_BLOCKS: [usize; 3] = [1, 8, 32];
 const SUSTAINED_DIAGNOSTIC_BLOCKS: usize = 8 * 1024 * 1024 / SdMmc::BLOCK_SIZE;
 const WARMUP_REQUESTS: usize = 64;
 const MATRIX_LATENCY_SAMPLE_STRIDE: usize = 16;
@@ -23,15 +25,20 @@ const COMPUTE_BASELINE_DURATION: Duration = Duration::from_secs(2);
 const COMPUTE_CASE_DURATION: Duration = Duration::from_secs(2);
 const CHECKSUM_SEED: u64 = 0xcbf2_9ce4_8422_2325;
 
-const WORKLOADS: [ReadWorkload; 2] = [
+const WORKLOADS: [ReadWorkload; 3] = [
     ReadWorkload {
         name: "cmd17_control",
         request_blocks: 1,
         total_blocks: 2 * 1024 * 1024 / SdMmc::BLOCK_SIZE,
     },
     ReadWorkload {
-        name: "cmd18_primary",
+        name: "cmd18_8block",
         request_blocks: 8,
+        total_blocks: 16 * 1024 * 1024 / SdMmc::BLOCK_SIZE,
+    },
+    ReadWorkload {
+        name: "cmd18_32block",
+        request_blocks: 32,
         total_blocks: 16 * 1024 * 1024 / SdMmc::BLOCK_SIZE,
     },
 ];
@@ -50,6 +57,203 @@ static DATA_WAIT_ELAPSED_NS: AtomicU64 = AtomicU64::new(0);
 static DEADLINE_FALLBACK: AtomicBool = AtomicBool::new(false);
 static TERMINAL_RINTSTS: AtomicU32 = AtomicU32::new(0);
 static TERMINAL_IDSTS: AtomicU32 = AtomicU32::new(0);
+
+static STAGE_OBSERVATION_ENABLED: AtomicBool = AtomicBool::new(false);
+static STAGE_OBSERVATION_CLOSED: AtomicBool = AtomicBool::new(true);
+static STAGE_GENERATION: AtomicUsize = AtomicUsize::new(0);
+static STAGE_API_START_NS: AtomicU64 = AtomicU64::new(0);
+static STAGE_API_END_NS: AtomicU64 = AtomicU64::new(0);
+static STAGE_PREPARE_START_NS: AtomicU64 = AtomicU64::new(0);
+static STAGE_PREPARE_END_NS: AtomicU64 = AtomicU64::new(0);
+static STAGE_CMD_WRITE_NS: AtomicU64 = AtomicU64::new(0);
+static STAGE_SUBMIT_END_NS: AtomicU64 = AtomicU64::new(0);
+static STAGE_COMMAND_SEEN_NS: AtomicU64 = AtomicU64::new(0);
+static STAGE_TERMINAL_SEEN_NS: AtomicU64 = AtomicU64::new(0);
+static STAGE_VALIDATION_END_NS: AtomicU64 = AtomicU64::new(0);
+static STAGE_CLEANUP_START_NS: AtomicU64 = AtomicU64::new(0);
+static STAGE_CLEANUP_END_NS: AtomicU64 = AtomicU64::new(0);
+static STAGE_FIRST_IRQ_NS: AtomicU64 = AtomicU64::new(0);
+static STAGE_IRQ_COMMAND_NS: AtomicU64 = AtomicU64::new(0);
+static STAGE_IRQ_DATA_DONE_NS: AtomicU64 = AtomicU64::new(0);
+static STAGE_IRQ_ACD_NS: AtomicU64 = AtomicU64::new(0);
+static STAGE_IRQ_RINTSTS: AtomicU32 = AtomicU32::new(0);
+static STAGE_IRQ_IDSTS: AtomicU32 = AtomicU32::new(0);
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct DriverStageObservation {
+    generation: usize,
+    api_start_ns: u64,
+    api_end_ns: u64,
+    prepare_start_ns: u64,
+    prepare_end_ns: u64,
+    cmd_write_ns: u64,
+    submit_end_ns: u64,
+    command_seen_ns: u64,
+    terminal_seen_ns: u64,
+    validation_end_ns: u64,
+    cleanup_start_ns: u64,
+    cleanup_end_ns: u64,
+    first_irq_ns: u64,
+    irq_command_ns: u64,
+    irq_data_done_ns: u64,
+    irq_acd_ns: u64,
+    irq_rintsts_bits: u32,
+    irq_idsts_bits: u32,
+}
+
+fn reset_stage_observation() {
+    STAGE_GENERATION.store(0, Ordering::Relaxed);
+    STAGE_API_START_NS.store(0, Ordering::Relaxed);
+    STAGE_API_END_NS.store(0, Ordering::Relaxed);
+    STAGE_PREPARE_START_NS.store(0, Ordering::Relaxed);
+    STAGE_PREPARE_END_NS.store(0, Ordering::Relaxed);
+    STAGE_CMD_WRITE_NS.store(0, Ordering::Relaxed);
+    STAGE_SUBMIT_END_NS.store(0, Ordering::Relaxed);
+    STAGE_COMMAND_SEEN_NS.store(0, Ordering::Relaxed);
+    STAGE_TERMINAL_SEEN_NS.store(0, Ordering::Relaxed);
+    STAGE_VALIDATION_END_NS.store(0, Ordering::Relaxed);
+    STAGE_CLEANUP_START_NS.store(0, Ordering::Relaxed);
+    STAGE_CLEANUP_END_NS.store(0, Ordering::Relaxed);
+    STAGE_FIRST_IRQ_NS.store(0, Ordering::Relaxed);
+    STAGE_IRQ_COMMAND_NS.store(0, Ordering::Relaxed);
+    STAGE_IRQ_DATA_DONE_NS.store(0, Ordering::Relaxed);
+    STAGE_IRQ_ACD_NS.store(0, Ordering::Relaxed);
+    STAGE_IRQ_RINTSTS.store(0, Ordering::Relaxed);
+    STAGE_IRQ_IDSTS.store(0, Ordering::Relaxed);
+}
+
+fn stage_observation_active() -> bool {
+    STAGE_OBSERVATION_ENABLED.load(Ordering::Acquire)
+        && !STAGE_OBSERVATION_CLOSED.load(Ordering::Acquire)
+}
+
+fn stage_generation_active(generation: usize) -> bool {
+    stage_observation_active() && STAGE_GENERATION.load(Ordering::Acquire) == generation
+}
+
+fn record_stage_now(slot: &AtomicU64) {
+    if stage_observation_active() {
+        slot.store(axhal::time::monotonic_time_nanos(), Ordering::Release);
+    }
+}
+
+fn record_stage_now_for_generation(slot: &AtomicU64, generation: usize) {
+    if stage_generation_active(generation) {
+        slot.store(axhal::time::monotonic_time_nanos(), Ordering::Release);
+    }
+}
+
+fn record_first_stage_time(slot: &AtomicU64, value: u64) {
+    let _ = slot.compare_exchange(0, value, Ordering::AcqRel, Ordering::Acquire);
+}
+
+fn begin_driver_stage_observation() {
+    STAGE_OBSERVATION_ENABLED.store(false, Ordering::Release);
+    STAGE_OBSERVATION_CLOSED.store(true, Ordering::Release);
+    reset_stage_observation();
+    STAGE_API_START_NS.store(axhal::time::monotonic_time_nanos(), Ordering::Relaxed);
+    STAGE_OBSERVATION_CLOSED.store(false, Ordering::Release);
+    STAGE_OBSERVATION_ENABLED.store(true, Ordering::Release);
+}
+
+fn finish_driver_stage_observation() -> DriverStageObservation {
+    STAGE_API_END_NS.store(axhal::time::monotonic_time_nanos(), Ordering::Release);
+    STAGE_OBSERVATION_CLOSED.store(true, Ordering::Release);
+    STAGE_OBSERVATION_ENABLED.store(false, Ordering::Release);
+
+    DriverStageObservation {
+        generation: STAGE_GENERATION.load(Ordering::Acquire),
+        api_start_ns: STAGE_API_START_NS.load(Ordering::Acquire),
+        api_end_ns: STAGE_API_END_NS.load(Ordering::Acquire),
+        prepare_start_ns: STAGE_PREPARE_START_NS.load(Ordering::Acquire),
+        prepare_end_ns: STAGE_PREPARE_END_NS.load(Ordering::Acquire),
+        cmd_write_ns: STAGE_CMD_WRITE_NS.load(Ordering::Acquire),
+        submit_end_ns: STAGE_SUBMIT_END_NS.load(Ordering::Acquire),
+        command_seen_ns: STAGE_COMMAND_SEEN_NS.load(Ordering::Acquire),
+        terminal_seen_ns: STAGE_TERMINAL_SEEN_NS.load(Ordering::Acquire),
+        validation_end_ns: STAGE_VALIDATION_END_NS.load(Ordering::Acquire),
+        cleanup_start_ns: STAGE_CLEANUP_START_NS.load(Ordering::Acquire),
+        cleanup_end_ns: STAGE_CLEANUP_END_NS.load(Ordering::Acquire),
+        first_irq_ns: STAGE_FIRST_IRQ_NS.load(Ordering::Acquire),
+        irq_command_ns: STAGE_IRQ_COMMAND_NS.load(Ordering::Acquire),
+        irq_data_done_ns: STAGE_IRQ_DATA_DONE_NS.load(Ordering::Acquire),
+        irq_acd_ns: STAGE_IRQ_ACD_NS.load(Ordering::Acquire),
+        irq_rintsts_bits: STAGE_IRQ_RINTSTS.load(Ordering::Acquire),
+        irq_idsts_bits: STAGE_IRQ_IDSTS.load(Ordering::Acquire),
+    }
+}
+
+pub(super) fn stage_observation_enabled() -> bool {
+    stage_observation_active()
+}
+
+pub(super) fn record_stage_prepare_start() {
+    record_stage_now(&STAGE_PREPARE_START_NS);
+}
+
+pub(super) fn record_stage_prepare_end() {
+    record_stage_now(&STAGE_PREPARE_END_NS);
+}
+
+pub(super) fn record_stage_generation(generation: usize) {
+    if stage_observation_active() {
+        STAGE_GENERATION.store(generation, Ordering::Release);
+    }
+}
+
+pub(super) fn record_stage_cmd_write(generation: usize) {
+    record_stage_now_for_generation(&STAGE_CMD_WRITE_NS, generation);
+}
+
+pub(super) fn record_stage_submit_end(generation: usize) {
+    record_stage_now_for_generation(&STAGE_SUBMIT_END_NS, generation);
+}
+
+pub(super) fn record_stage_command_seen(generation: usize) {
+    record_stage_now_for_generation(&STAGE_COMMAND_SEEN_NS, generation);
+}
+
+pub(super) fn record_stage_terminal_seen(generation: usize) {
+    record_stage_now_for_generation(&STAGE_TERMINAL_SEEN_NS, generation);
+}
+
+pub(super) fn record_stage_validation_end(generation: usize) {
+    record_stage_now_for_generation(&STAGE_VALIDATION_END_NS, generation);
+}
+
+pub(super) fn record_stage_cleanup_start(generation: usize) {
+    record_stage_now_for_generation(&STAGE_CLEANUP_START_NS, generation);
+}
+
+pub(super) fn record_stage_cleanup_end(generation: usize) {
+    record_stage_now_for_generation(&STAGE_CLEANUP_END_NS, generation);
+}
+
+pub(super) fn record_stage_irq(
+    generation: usize,
+    irq_entry_ns: u64,
+    rintsts_bits: u32,
+    idsts_bits: u32,
+) {
+    if !stage_generation_active(generation) {
+        return;
+    }
+
+    let rintsts = crate::regs::RIntSts::from_bits(rintsts_bits);
+    let idsts = crate::regs::IdSts::from_bits(idsts_bits);
+    record_first_stage_time(&STAGE_FIRST_IRQ_NS, irq_entry_ns);
+    if rintsts.command_done() {
+        record_first_stage_time(&STAGE_IRQ_COMMAND_NS, irq_entry_ns);
+    }
+    if rintsts.data_transfer_over() || idsts.ri() || idsts.ti() {
+        record_first_stage_time(&STAGE_IRQ_DATA_DONE_NS, irq_entry_ns);
+    }
+    if rintsts.auto_command_done() {
+        record_first_stage_time(&STAGE_IRQ_ACD_NS, irq_entry_ns);
+    }
+    STAGE_IRQ_RINTSTS.fetch_or(rintsts_bits, Ordering::AcqRel);
+    STAGE_IRQ_IDSTS.fetch_or(idsts_bits, Ordering::AcqRel);
+}
 
 pub(super) fn observation_enabled() -> bool {
     OBSERVATION_ENABLED.load(Ordering::Acquire)
@@ -241,6 +445,28 @@ enum IoMode {
     Async,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RangeScope {
+    Short,
+    Wide,
+}
+
+impl RangeScope {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Short => "short_128k",
+            Self::Wide => "wide_2m",
+        }
+    }
+
+    const fn total_blocks(self) -> usize {
+        match self {
+            Self::Short => LEGACY_CONTROL_BLOCKS,
+            Self::Wide => RANGE_DIAGNOSTIC_WIDE_BLOCKS,
+        }
+    }
+}
+
 impl IoMode {
     const fn name(self) -> &'static str {
         match self {
@@ -287,6 +513,13 @@ enum TestFailure {
         request: usize,
         reason: &'static str,
         observation: AsyncObservation,
+    },
+    StageObservation {
+        workload: &'static str,
+        mode: IoMode,
+        request: usize,
+        reason: &'static str,
+        observation: DriverStageObservation,
     },
 }
 
@@ -344,6 +577,42 @@ impl TestFailure {
                 observation.deadline_fallback,
                 observation.rintsts_bits,
                 observation.idsts_bits,
+            ),
+            Self::StageObservation {
+                workload,
+                mode,
+                request,
+                reason,
+                observation,
+            } => warn!(
+                "SDMMC_CONCURRENCY_FAILURE kind=stage_observation workload={} io={} \
+                 request={} reason={} \
+                 generation={} api={}..{} prepare={}..{} cmd_write={} submit_end={} \
+                 command_seen={} terminal_seen={} validation_end={} cleanup={}..{} \
+                 first_irq={} irq_command={} irq_data_done={} irq_acd={} \
+                 RINTSTS=0x{:08x} IDSTS=0x{:08x}",
+                workload,
+                mode.name(),
+                request,
+                reason,
+                observation.generation,
+                observation.api_start_ns,
+                observation.api_end_ns,
+                observation.prepare_start_ns,
+                observation.prepare_end_ns,
+                observation.cmd_write_ns,
+                observation.submit_end_ns,
+                observation.command_seen_ns,
+                observation.terminal_seen_ns,
+                observation.validation_end_ns,
+                observation.cleanup_start_ns,
+                observation.cleanup_end_ns,
+                observation.first_irq_ns,
+                observation.irq_command_ns,
+                observation.irq_data_done_ns,
+                observation.irq_acd_ns,
+                observation.irq_rintsts_bits,
+                observation.irq_idsts_bits,
             ),
         }
     }
@@ -806,6 +1075,363 @@ fn throughput_mib_s_milli(bytes: u64, elapsed_ns: u64) -> u64 {
         / (elapsed_ns.max(1) as u128 * 1024u128 * 1024u128)) as u64
 }
 
+fn ratio_permille(numerator: u64, denominator: u64) -> u64 {
+    ((numerator as u128 * 1_000) / denominator.max(1) as u128) as u64
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StageDurations {
+    api_total_ns: u64,
+    api_to_prepare_ns: u64,
+    prepare_ns: u64,
+    prepare_to_cmd_ns: u64,
+    submit_ns: u64,
+    command_wait_ns: u64,
+    data_wait_ns: u64,
+    validation_ns: u64,
+    validation_to_cleanup_ns: u64,
+    cleanup_ns: u64,
+    copy_to_user_ns: u64,
+    command_to_terminal_ns: u64,
+    software_ns: u64,
+    irq_to_terminal_ns: u64,
+    data_irq_to_acd_ns: u64,
+}
+
+impl StageDurations {
+    fn from_observation(
+        observation: DriverStageObservation,
+        request_blocks: usize,
+    ) -> Result<Self, &'static str> {
+        if observation.generation == 0 {
+            return Err("missing_generation");
+        }
+        let ordered = [
+            observation.api_start_ns,
+            observation.prepare_start_ns,
+            observation.prepare_end_ns,
+            observation.cmd_write_ns,
+            observation.submit_end_ns,
+            observation.command_seen_ns,
+            observation.terminal_seen_ns,
+            observation.validation_end_ns,
+            observation.cleanup_start_ns,
+            observation.cleanup_end_ns,
+            observation.api_end_ns,
+        ];
+        if ordered.contains(&0) {
+            return Err("missing_stage_timestamp");
+        }
+        if !ordered.windows(2).all(|pair| pair[0] <= pair[1]) {
+            return Err("stage_timestamp_order");
+        }
+
+        let api_to_prepare_ns = observation
+            .prepare_start_ns
+            .saturating_sub(observation.api_start_ns);
+        let prepare_ns = observation
+            .prepare_end_ns
+            .saturating_sub(observation.prepare_start_ns);
+        let prepare_to_cmd_ns = observation
+            .cmd_write_ns
+            .saturating_sub(observation.prepare_end_ns);
+        let submit_ns = observation
+            .submit_end_ns
+            .saturating_sub(observation.cmd_write_ns);
+        let command_wait_ns = observation
+            .command_seen_ns
+            .saturating_sub(observation.submit_end_ns);
+        let data_wait_ns = observation
+            .terminal_seen_ns
+            .saturating_sub(observation.command_seen_ns);
+        let validation_ns = observation
+            .validation_end_ns
+            .saturating_sub(observation.terminal_seen_ns);
+        let validation_to_cleanup_ns = observation
+            .cleanup_start_ns
+            .saturating_sub(observation.validation_end_ns);
+        let cleanup_ns = observation
+            .cleanup_end_ns
+            .saturating_sub(observation.cleanup_start_ns);
+        let copy_to_user_ns = observation
+            .api_end_ns
+            .saturating_sub(observation.cleanup_end_ns);
+        let command_to_terminal_ns = observation
+            .terminal_seen_ns
+            .saturating_sub(observation.cmd_write_ns);
+        let software_ns = api_to_prepare_ns
+            .saturating_add(prepare_ns)
+            .saturating_add(prepare_to_cmd_ns)
+            .saturating_add(validation_ns)
+            .saturating_add(validation_to_cleanup_ns)
+            .saturating_add(cleanup_ns)
+            .saturating_add(copy_to_user_ns);
+        let terminal_irq_ns = if request_blocks == 1 {
+            observation.irq_data_done_ns
+        } else if observation.irq_data_done_ns != 0 && observation.irq_acd_ns != 0 {
+            observation.irq_data_done_ns.max(observation.irq_acd_ns)
+        } else {
+            0
+        };
+        let irq_to_terminal_ns = if terminal_irq_ns != 0
+            && terminal_irq_ns <= observation.terminal_seen_ns
+        {
+            observation.terminal_seen_ns - terminal_irq_ns
+        } else {
+            0
+        };
+        let data_irq_to_acd_ns = if observation.irq_data_done_ns != 0
+            && observation.irq_acd_ns >= observation.irq_data_done_ns
+        {
+            observation.irq_acd_ns - observation.irq_data_done_ns
+        } else {
+            0
+        };
+
+        Ok(Self {
+            api_total_ns: observation
+                .api_end_ns
+                .saturating_sub(observation.api_start_ns),
+            api_to_prepare_ns,
+            prepare_ns,
+            prepare_to_cmd_ns,
+            submit_ns,
+            command_wait_ns,
+            data_wait_ns,
+            validation_ns,
+            validation_to_cleanup_ns,
+            cleanup_ns,
+            copy_to_user_ns,
+            command_to_terminal_ns,
+            software_ns,
+            irq_to_terminal_ns,
+            data_irq_to_acd_ns,
+        })
+    }
+}
+
+#[derive(Default)]
+struct StageAggregate {
+    requests: usize,
+    api_total_ns: u128,
+    api_to_prepare_ns: u128,
+    prepare_ns: u128,
+    prepare_to_cmd_ns: u128,
+    submit_ns: u128,
+    command_wait_ns: u128,
+    data_wait_ns: u128,
+    validation_ns: u128,
+    validation_to_cleanup_ns: u128,
+    cleanup_ns: u128,
+    copy_to_user_ns: u128,
+    command_to_terminal_ns: u128,
+    software_ns: u128,
+    irq_to_terminal_ns: u128,
+    irq_to_terminal_samples: usize,
+    data_irq_to_acd_ns: u128,
+    data_irq_to_acd_samples: usize,
+    irq_rintsts_bits: u32,
+    irq_idsts_bits: u32,
+    slowest_api_ns: u64,
+    slowest_request: usize,
+    slowest_lba: u32,
+    slowest: Option<StageDurations>,
+}
+
+impl StageAggregate {
+    fn add(
+        &mut self,
+        request: usize,
+        lba: u32,
+        durations: StageDurations,
+        observation: DriverStageObservation,
+    ) {
+        self.requests += 1;
+        self.api_total_ns += durations.api_total_ns as u128;
+        self.api_to_prepare_ns += durations.api_to_prepare_ns as u128;
+        self.prepare_ns += durations.prepare_ns as u128;
+        self.prepare_to_cmd_ns += durations.prepare_to_cmd_ns as u128;
+        self.submit_ns += durations.submit_ns as u128;
+        self.command_wait_ns += durations.command_wait_ns as u128;
+        self.data_wait_ns += durations.data_wait_ns as u128;
+        self.validation_ns += durations.validation_ns as u128;
+        self.validation_to_cleanup_ns += durations.validation_to_cleanup_ns as u128;
+        self.cleanup_ns += durations.cleanup_ns as u128;
+        self.copy_to_user_ns += durations.copy_to_user_ns as u128;
+        self.command_to_terminal_ns += durations.command_to_terminal_ns as u128;
+        self.software_ns += durations.software_ns as u128;
+        if durations.irq_to_terminal_ns != 0 {
+            self.irq_to_terminal_ns += durations.irq_to_terminal_ns as u128;
+            self.irq_to_terminal_samples += 1;
+        }
+        if durations.data_irq_to_acd_ns != 0 {
+            self.data_irq_to_acd_ns += durations.data_irq_to_acd_ns as u128;
+            self.data_irq_to_acd_samples += 1;
+        }
+        self.irq_rintsts_bits |= observation.irq_rintsts_bits;
+        self.irq_idsts_bits |= observation.irq_idsts_bits;
+        if durations.api_total_ns > self.slowest_api_ns {
+            self.slowest_api_ns = durations.api_total_ns;
+            self.slowest_request = request;
+            self.slowest_lba = lba;
+            self.slowest = Some(durations);
+        }
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.requests += other.requests;
+        self.api_total_ns += other.api_total_ns;
+        self.api_to_prepare_ns += other.api_to_prepare_ns;
+        self.prepare_ns += other.prepare_ns;
+        self.prepare_to_cmd_ns += other.prepare_to_cmd_ns;
+        self.submit_ns += other.submit_ns;
+        self.command_wait_ns += other.command_wait_ns;
+        self.data_wait_ns += other.data_wait_ns;
+        self.validation_ns += other.validation_ns;
+        self.validation_to_cleanup_ns += other.validation_to_cleanup_ns;
+        self.cleanup_ns += other.cleanup_ns;
+        self.copy_to_user_ns += other.copy_to_user_ns;
+        self.command_to_terminal_ns += other.command_to_terminal_ns;
+        self.software_ns += other.software_ns;
+        self.irq_to_terminal_ns += other.irq_to_terminal_ns;
+        self.irq_to_terminal_samples += other.irq_to_terminal_samples;
+        self.data_irq_to_acd_ns += other.data_irq_to_acd_ns;
+        self.data_irq_to_acd_samples += other.data_irq_to_acd_samples;
+        self.irq_rintsts_bits |= other.irq_rintsts_bits;
+        self.irq_idsts_bits |= other.irq_idsts_bits;
+        if other.slowest_api_ns > self.slowest_api_ns {
+            self.slowest_api_ns = other.slowest_api_ns;
+            self.slowest_request = other.slowest_request;
+            self.slowest_lba = other.slowest_lba;
+            self.slowest = other.slowest;
+        }
+    }
+
+    fn average(&self, total: u128) -> u64 {
+        (total / self.requests.max(1) as u128) as u64
+    }
+
+    fn irq_to_terminal_average(&self) -> u64 {
+        (self.irq_to_terminal_ns / self.irq_to_terminal_samples.max(1) as u128) as u64
+    }
+
+    fn data_irq_to_acd_average(&self) -> u64 {
+        (self.data_irq_to_acd_ns / self.data_irq_to_acd_samples.max(1) as u128) as u64
+    }
+}
+
+struct RangeStageRound {
+    elapsed_ns: u64,
+    checksum: u64,
+    stages: StageAggregate,
+}
+
+struct RangeStageSummary {
+    scope: RangeScope,
+    request_blocks: usize,
+    io_mode: IoMode,
+    throughput_mib_s_milli: Vec<u64>,
+    elapsed_total_ns: u64,
+    stages: StageAggregate,
+}
+
+#[derive(Clone, Copy)]
+struct RangeStageSnapshot {
+    scope: RangeScope,
+    request_blocks: usize,
+    io_mode: IoMode,
+    throughput_mib_s_milli: u64,
+    api_average_ns: u64,
+    command_to_terminal_average_ns: u64,
+    software_average_ns: u64,
+    irq_to_terminal_average_ns: u64,
+}
+
+impl RangeStageSummary {
+    fn new(scope: RangeScope, request_blocks: usize, io_mode: IoMode) -> Self {
+        Self {
+            scope,
+            request_blocks,
+            io_mode,
+            throughput_mib_s_milli: Vec::with_capacity(TEST_ROUNDS),
+            elapsed_total_ns: 0,
+            stages: StageAggregate::default(),
+        }
+    }
+
+    fn add_round(&mut self, round: &RangeStageRound) {
+        let bytes = self.scope.total_blocks() * SdMmc::BLOCK_SIZE;
+        self.throughput_mib_s_milli
+            .push(throughput_mib_s_milli(bytes as u64, round.elapsed_ns));
+        self.elapsed_total_ns = self.elapsed_total_ns.saturating_add(round.elapsed_ns);
+        self.stages.merge(&round.stages);
+    }
+
+    fn report(&self) -> RangeStageSnapshot {
+        let throughput = scalar_stats(&self.throughput_mib_s_milli);
+        let aggregate_throughput = throughput_mib_s_milli(
+            (self.scope.total_blocks() * SdMmc::BLOCK_SIZE * TEST_ROUNDS) as u64,
+            self.elapsed_total_ns,
+        );
+        warn!(
+            "SDMMC_RANGE_STAGE_SUMMARY scope={} start_lba={} end_lba={} request_blocks={} \
+             io={} rounds={} requests={} aggregate_mib_s_milli={} mean_mib_s_milli={} \
+             min_mib_s_milli={} max_mib_s_milli={} stddev_mib_s_milli={} \
+             api_avg_ns={} api_to_prepare_avg_ns={} prepare_avg_ns={} \
+             prepare_to_cmd_avg_ns={} submit_avg_ns={} command_wait_avg_ns={} \
+             data_wait_avg_ns={} validation_avg_ns={} validation_to_cleanup_avg_ns={} \
+             cleanup_avg_ns={} copy_to_user_avg_ns={} command_to_terminal_avg_ns={} \
+             software_avg_ns={} irq_to_terminal_samples={} irq_to_terminal_avg_ns={} \
+             data_irq_to_acd_samples={} data_irq_to_acd_avg_ns={} \
+             RINTSTS_OR=0x{:08x} IDSTS_OR=0x{:08x} data_ok=true terminal_ok=true",
+            self.scope.name(),
+            TEST_START_LBA,
+            TEST_START_LBA + self.scope.total_blocks() as u32 - 1,
+            self.request_blocks,
+            self.io_mode.name(),
+            TEST_ROUNDS,
+            self.stages.requests,
+            aggregate_throughput,
+            throughput.mean,
+            throughput.min,
+            throughput.max,
+            throughput.stddev,
+            self.stages.average(self.stages.api_total_ns),
+            self.stages.average(self.stages.api_to_prepare_ns),
+            self.stages.average(self.stages.prepare_ns),
+            self.stages.average(self.stages.prepare_to_cmd_ns),
+            self.stages.average(self.stages.submit_ns),
+            self.stages.average(self.stages.command_wait_ns),
+            self.stages.average(self.stages.data_wait_ns),
+            self.stages.average(self.stages.validation_ns),
+            self.stages.average(self.stages.validation_to_cleanup_ns),
+            self.stages.average(self.stages.cleanup_ns),
+            self.stages.average(self.stages.copy_to_user_ns),
+            self.stages.average(self.stages.command_to_terminal_ns),
+            self.stages.average(self.stages.software_ns),
+            self.stages.irq_to_terminal_samples,
+            self.stages.irq_to_terminal_average(),
+            self.stages.data_irq_to_acd_samples,
+            self.stages.data_irq_to_acd_average(),
+            self.stages.irq_rintsts_bits,
+            self.stages.irq_idsts_bits,
+        );
+
+        RangeStageSnapshot {
+            scope: self.scope,
+            request_blocks: self.request_blocks,
+            io_mode: self.io_mode,
+            throughput_mib_s_milli: aggregate_throughput,
+            api_average_ns: self.stages.average(self.stages.api_total_ns),
+            command_to_terminal_average_ns: self
+                .stages
+                .average(self.stages.command_to_terminal_ns),
+            software_average_ns: self.stages.average(self.stages.software_ns),
+            irq_to_terminal_average_ns: self.stages.irq_to_terminal_average(),
+        }
+    }
+}
+
 fn update_checksum(mut checksum: u64, bytes: &[u8]) -> u64 {
     for &byte in bytes {
         checksum ^= byte as u64;
@@ -1004,6 +1630,418 @@ impl SdMmc {
         let elapsed_ns = axhal::time::monotonic_time_nanos().saturating_sub(started_ns);
         measurements.checksum = update_checksum(CHECKSUM_SEED, buffer);
         Ok((elapsed_ns, measurements))
+    }
+
+    fn run_stage_read_request(
+        &mut self,
+        workload: ReadWorkload,
+        io_mode: IoMode,
+        request: usize,
+        lba: u32,
+        buffer: &mut [u8],
+    ) -> Result<(StageDurations, DriverStageObservation), TestFailure> {
+        debug_assert_eq!(buffer.len(), workload.request_bytes());
+        debug_assert!(RANGE_DIAGNOSTIC_REQUEST_BLOCKS.contains(&workload.request_blocks));
+
+        begin_driver_stage_observation();
+        let read_result = match io_mode {
+            IoMode::Sync => self.read_blocks(lba, buffer),
+            IoMode::Async => {
+                set_observation_enabled(true);
+                let result = axtask::future::block_on(self.read_blocks_async(lba, buffer));
+                set_observation_enabled(false);
+                result
+            }
+        };
+        let observation = finish_driver_stage_observation();
+        read_result.map_err(|error| TestFailure::Io {
+            mode: io_mode,
+            request,
+            error,
+        })?;
+
+        if io_mode == IoMode::Async {
+            self.validate_async_observation(workload, request, async_observation())?;
+        }
+        let durations = StageDurations::from_observation(observation, workload.request_blocks)
+            .map_err(|reason| TestFailure::StageObservation {
+                workload: workload.name,
+                mode: io_mode,
+                request,
+                reason,
+                observation,
+            })?;
+        Ok((durations, observation))
+    }
+
+    fn run_range_stage_round(
+        &mut self,
+        scope: RangeScope,
+        request_blocks: usize,
+        io_mode: IoMode,
+        expected_checksum: u64,
+        buffer: &mut [u8],
+    ) -> Result<RangeStageRound, TestFailure> {
+        let workload = ReadWorkload {
+            name: match request_blocks {
+                1 => "range_cmd17",
+                8 => "range_cmd18_8block",
+                32 => "range_cmd18_32block",
+                _ => unreachable!(),
+            },
+            request_blocks,
+            total_blocks: scope.total_blocks(),
+        };
+        debug_assert_eq!(buffer.len(), workload.total_bytes());
+        buffer.fill(0);
+        let mut stages = StageAggregate::default();
+        let started_ns = axhal::time::monotonic_time_nanos();
+        for request in 0..workload.request_count() {
+            let lba = TEST_START_LBA + (request * request_blocks) as u32;
+            let offset = request * workload.request_bytes();
+            let request_buffer = &mut buffer[offset..offset + workload.request_bytes()];
+            let (durations, observation) = self.run_stage_read_request(
+                workload,
+                io_mode,
+                request,
+                lba,
+                request_buffer,
+            )?;
+            stages.add(request, lba, durations, observation);
+        }
+        let elapsed_ns = axhal::time::monotonic_time_nanos().saturating_sub(started_ns);
+        let checksum = update_checksum(CHECKSUM_SEED, buffer);
+        if checksum != expected_checksum {
+            return Err(TestFailure::DataMismatch {
+                workload: workload.name,
+                expected: expected_checksum,
+                actual: checksum,
+            });
+        }
+        Ok(RangeStageRound {
+            elapsed_ns,
+            checksum,
+            stages,
+        })
+    }
+
+    fn log_range_stage_round(
+        scope: RangeScope,
+        request_blocks: usize,
+        round: usize,
+        io_mode: IoMode,
+        result: &RangeStageRound,
+    ) {
+        let stages = &result.stages;
+        warn!(
+            "SDMMC_RANGE_STAGE_RESULT scope={} start_lba={} end_lba={} request_blocks={} \
+             round={} io={} elapsed_ns={} bytes={} requests={} throughput_mib_s_milli={} \
+             api_avg_ns={} api_to_prepare_avg_ns={} prepare_avg_ns={} \
+             prepare_to_cmd_avg_ns={} submit_avg_ns={} command_wait_avg_ns={} \
+             data_wait_avg_ns={} validation_avg_ns={} validation_to_cleanup_avg_ns={} \
+             cleanup_avg_ns={} copy_to_user_avg_ns={} command_to_terminal_avg_ns={} \
+             software_avg_ns={} irq_to_terminal_samples={} irq_to_terminal_avg_ns={} \
+             data_irq_to_acd_samples={} data_irq_to_acd_avg_ns={} checksum=0x{:016x} \
+             data_ok=true terminal_ok=true",
+            scope.name(),
+            TEST_START_LBA,
+            TEST_START_LBA + scope.total_blocks() as u32 - 1,
+            request_blocks,
+            round,
+            io_mode.name(),
+            result.elapsed_ns,
+            scope.total_blocks() * SdMmc::BLOCK_SIZE,
+            stages.requests,
+            throughput_mib_s_milli(
+                (scope.total_blocks() * SdMmc::BLOCK_SIZE) as u64,
+                result.elapsed_ns,
+            ),
+            stages.average(stages.api_total_ns),
+            stages.average(stages.api_to_prepare_ns),
+            stages.average(stages.prepare_ns),
+            stages.average(stages.prepare_to_cmd_ns),
+            stages.average(stages.submit_ns),
+            stages.average(stages.command_wait_ns),
+            stages.average(stages.data_wait_ns),
+            stages.average(stages.validation_ns),
+            stages.average(stages.validation_to_cleanup_ns),
+            stages.average(stages.cleanup_ns),
+            stages.average(stages.copy_to_user_ns),
+            stages.average(stages.command_to_terminal_ns),
+            stages.average(stages.software_ns),
+            stages.irq_to_terminal_samples,
+            stages.irq_to_terminal_average(),
+            stages.data_irq_to_acd_samples,
+            stages.data_irq_to_acd_average(),
+            result.checksum,
+        );
+        if let Some(slowest) = stages.slowest {
+            warn!(
+                "SDMMC_RANGE_STAGE_SLOWEST scope={} request_blocks={} round={} io={} \
+                 request={} lba={} api_total_ns={} api_to_prepare_ns={} prepare_ns={} \
+                 prepare_to_cmd_ns={} submit_ns={} command_wait_ns={} data_wait_ns={} \
+                 validation_ns={} validation_to_cleanup_ns={} cleanup_ns={} \
+                 copy_to_user_ns={} command_to_terminal_ns={} software_ns={} \
+                 irq_to_terminal_ns={} data_irq_to_acd_ns={}",
+                scope.name(),
+                request_blocks,
+                round,
+                io_mode.name(),
+                stages.slowest_request,
+                stages.slowest_lba,
+                slowest.api_total_ns,
+                slowest.api_to_prepare_ns,
+                slowest.prepare_ns,
+                slowest.prepare_to_cmd_ns,
+                slowest.submit_ns,
+                slowest.command_wait_ns,
+                slowest.data_wait_ns,
+                slowest.validation_ns,
+                slowest.validation_to_cleanup_ns,
+                slowest.cleanup_ns,
+                slowest.copy_to_user_ns,
+                slowest.command_to_terminal_ns,
+                slowest.software_ns,
+                slowest.irq_to_terminal_ns,
+                slowest.data_irq_to_acd_ns,
+            );
+        }
+    }
+
+    fn find_range_snapshot(
+        snapshots: &[RangeStageSnapshot],
+        scope: RangeScope,
+        request_blocks: usize,
+        io_mode: IoMode,
+    ) -> RangeStageSnapshot {
+        *snapshots
+            .iter()
+            .find(|snapshot| {
+                snapshot.scope == scope
+                    && snapshot.request_blocks == request_blocks
+                    && snapshot.io_mode == io_mode
+            })
+            .expect("complete range-stage result matrix")
+    }
+
+    fn report_range_stage_comparisons(snapshots: &[RangeStageSnapshot]) {
+        for scope in [RangeScope::Short, RangeScope::Wide] {
+            for io_mode in [IoMode::Sync, IoMode::Async] {
+                let one = Self::find_range_snapshot(snapshots, scope, 1, io_mode);
+                let eight = Self::find_range_snapshot(snapshots, scope, 8, io_mode);
+                let thirty_two = Self::find_range_snapshot(snapshots, scope, 32, io_mode);
+                warn!(
+                    "SDMMC_RANGE_REQUEST_COMPARISON scope={} start_lba={} end_lba={} io={} \
+                     rounds_each={} block1_mib_s_milli={} block8_mib_s_milli={} \
+                     block32_mib_s_milli={} block8_vs_block1_permille={} \
+                     block32_vs_block1_permille={} block32_vs_block8_permille={} \
+                     strict_same_lba_range=true",
+                    scope.name(),
+                    TEST_START_LBA,
+                    TEST_START_LBA + scope.total_blocks() as u32 - 1,
+                    io_mode.name(),
+                    TEST_ROUNDS,
+                    one.throughput_mib_s_milli,
+                    eight.throughput_mib_s_milli,
+                    thirty_two.throughput_mib_s_milli,
+                    ratio_permille(
+                        eight.throughput_mib_s_milli,
+                        one.throughput_mib_s_milli,
+                    ),
+                    ratio_permille(
+                        thirty_two.throughput_mib_s_milli,
+                        one.throughput_mib_s_milli,
+                    ),
+                    ratio_permille(
+                        thirty_two.throughput_mib_s_milli,
+                        eight.throughput_mib_s_milli,
+                    ),
+                );
+            }
+        }
+
+        for scope in [RangeScope::Short, RangeScope::Wide] {
+            for request_blocks in RANGE_DIAGNOSTIC_REQUEST_BLOCKS {
+                let sync =
+                    Self::find_range_snapshot(snapshots, scope, request_blocks, IoMode::Sync);
+                let asynchronous =
+                    Self::find_range_snapshot(snapshots, scope, request_blocks, IoMode::Async);
+                warn!(
+                    "SDMMC_RANGE_ASYNC_COMPARISON scope={} request_blocks={} \
+                     sync_mib_s_milli={} async_mib_s_milli={} \
+                     async_vs_sync_permille={} sync_api_avg_ns={} async_api_avg_ns={} \
+                     async_extra_api_ns={} async_irq_to_terminal_avg_ns={} \
+                     data_ok=true terminal_ok=true",
+                    scope.name(),
+                    request_blocks,
+                    sync.throughput_mib_s_milli,
+                    asynchronous.throughput_mib_s_milli,
+                    ratio_permille(
+                        asynchronous.throughput_mib_s_milli,
+                        sync.throughput_mib_s_milli,
+                    ),
+                    sync.api_average_ns,
+                    asynchronous.api_average_ns,
+                    asynchronous
+                        .api_average_ns
+                        .saturating_sub(sync.api_average_ns),
+                    asynchronous.irq_to_terminal_average_ns,
+                );
+            }
+        }
+
+        for request_blocks in RANGE_DIAGNOSTIC_REQUEST_BLOCKS {
+            let short = Self::find_range_snapshot(
+                snapshots,
+                RangeScope::Short,
+                request_blocks,
+                IoMode::Sync,
+            );
+            let wide = Self::find_range_snapshot(
+                snapshots,
+                RangeScope::Wide,
+                request_blocks,
+                IoMode::Sync,
+            );
+            let range_ratio = ratio_permille(
+                wide.throughput_mib_s_milli,
+                short.throughput_mib_s_milli,
+            );
+            let extra_api_ns = wide.api_average_ns.saturating_sub(short.api_average_ns);
+            let extra_command_to_terminal_ns = wide
+                .command_to_terminal_average_ns
+                .saturating_sub(short.command_to_terminal_average_ns);
+            let extra_software_ns = wide
+                .software_average_ns
+                .saturating_sub(short.software_average_ns);
+            let command_share_permille = ratio_permille(extra_command_to_terminal_ns, extra_api_ns);
+            let software_share_permille = ratio_permille(extra_software_ns, extra_api_ns);
+            let classification = if range_ratio >= 950 {
+                "no_material_range_slowdown"
+            } else if command_share_permille >= 700 {
+                "card_controller_or_bus_wait_dominant"
+            } else if software_share_permille >= 700 {
+                "driver_software_dominant"
+            } else {
+                "mixed_or_inconclusive"
+            };
+            warn!(
+                "SDMMC_RANGE_ROOT_CAUSE request_blocks={} basis=sync_path \
+                 short_mib_s_milli={} wide_mib_s_milli={} wide_vs_short_permille={} \
+                 short_api_avg_ns={} wide_api_avg_ns={} extra_api_ns={} \
+                 short_command_to_terminal_avg_ns={} wide_command_to_terminal_avg_ns={} \
+                 extra_command_to_terminal_ns={} command_extra_share_permille={} \
+                 short_software_avg_ns={} wide_software_avg_ns={} extra_software_ns={} \
+                 software_extra_share_permille={} classification={} \
+                 sd_card_internal_proven=false controller_or_bus_excluded=false \
+                 next_discriminator=second_card_or_sd_bus_trace",
+                request_blocks,
+                short.throughput_mib_s_milli,
+                wide.throughput_mib_s_milli,
+                range_ratio,
+                short.api_average_ns,
+                wide.api_average_ns,
+                extra_api_ns,
+                short.command_to_terminal_average_ns,
+                wide.command_to_terminal_average_ns,
+                extra_command_to_terminal_ns,
+                command_share_permille,
+                short.software_average_ns,
+                wide.software_average_ns,
+                extra_software_ns,
+                software_share_permille,
+                classification,
+            );
+        }
+    }
+
+    fn run_range_stage_diagnostic(&mut self) -> Result<(), TestFailure> {
+        warn!(
+            "SDMMC_RANGE_STAGE begin start_lba={} scopes=short_128k:256blocks,wide_2m:4096blocks \
+             request_blocks=1,8,32 rounds_each_mode={} \
+             order=odd_round_sync_async,even_round_async_sync \
+             strict_same_start_lba=true one_dma_command_per_request=true \
+             stages=api,prepare,submit,command_wait,data_wait,validation,cleanup,copy,irq_resume",
+            TEST_START_LBA,
+            TEST_ROUNDS,
+        );
+        let mut snapshots = Vec::with_capacity(12);
+        for scope in [RangeScope::Short, RangeScope::Wide] {
+            let reference_workload = ReadWorkload {
+                name: "range_reference_cmd18_32block",
+                request_blocks: 32,
+                total_blocks: scope.total_blocks(),
+            };
+            let mut buffer = vec![0u8; reference_workload.total_bytes()];
+            let (_, reference) = self.run_timed_read_round(
+                reference_workload,
+                IoMode::Sync,
+                None,
+                &mut buffer,
+            )?;
+            let expected_checksum = reference.checksum;
+            warn!(
+                "SDMMC_RANGE_STAGE_REFERENCE scope={} start_lba={} end_lba={} \
+                 blocks={} checksum=0x{:016x} data_ok=true",
+                scope.name(),
+                TEST_START_LBA,
+                TEST_START_LBA + scope.total_blocks() as u32 - 1,
+                scope.total_blocks(),
+                expected_checksum,
+            );
+
+            for request_blocks in RANGE_DIAGNOSTIC_REQUEST_BLOCKS {
+                let mut sync = RangeStageSummary::new(scope, request_blocks, IoMode::Sync);
+                let mut asynchronous =
+                    RangeStageSummary::new(scope, request_blocks, IoMode::Async);
+                for round_index in 0..TEST_ROUNDS {
+                    let round = round_index + 1;
+                    let modes = if round_index.is_multiple_of(2) {
+                        [IoMode::Sync, IoMode::Async]
+                    } else {
+                        [IoMode::Async, IoMode::Sync]
+                    };
+                    for io_mode in modes {
+                        warn!(
+                            "SDMMC_RANGE_STAGE_CASE_BEGIN scope={} request_blocks={} round={} \
+                             io={} start_lba={} end_lba={}",
+                            scope.name(),
+                            request_blocks,
+                            round,
+                            io_mode.name(),
+                            TEST_START_LBA,
+                            TEST_START_LBA + scope.total_blocks() as u32 - 1,
+                        );
+                        let result = self.run_range_stage_round(
+                            scope,
+                            request_blocks,
+                            io_mode,
+                            expected_checksum,
+                            &mut buffer,
+                        )?;
+                        Self::log_range_stage_round(
+                            scope,
+                            request_blocks,
+                            round,
+                            io_mode,
+                            &result,
+                        );
+                        match io_mode {
+                            IoMode::Sync => sync.add_round(&result),
+                            IoMode::Async => asynchronous.add_round(&result),
+                        }
+                    }
+                }
+                snapshots.push(sync.report());
+                snapshots.push(asynchronous.report());
+            }
+        }
+        Self::report_range_stage_comparisons(&snapshots);
+        warn!(
+            "SDMMC_RANGE_STAGE PASS scopes=2 request_sizes=3 sync_rounds_each=5 \
+             async_rounds_each=5 strict_same_lba_range=true data_ok=true terminal_ok=true"
+        );
+        Ok(())
     }
 
     fn run_legacy_short_region_control(&mut self) -> Result<(), TestFailure> {
@@ -1496,8 +2534,9 @@ impl SdMmc {
         warn!(
             "SDMMC_CONCURRENCY_TEST begin destructive=false read_only=true start_lba={} \
              max_end_lba={} rounds={} smp={} scheduler_expected=RR \
-             request_plan=CMD17_1block_2MiB,CMD18_8blocks_16MiB \
+             request_plan=CMD17_1block_2MiB,CMD18_8blocks_16MiB,CMD18_32blocks_16MiB \
              legacy_control=CMD17_1block_128KiB_x5 \
+             strict_range_control=1,8,32blocks_x_sync,async_x5_short128KiB,wide2MiB \
              sustained_diagnostic=CMD17_1block_8MiB_ABBA one_request_in_flight=true \
              latency_sample_stride={} compute_iterations_per_unit={} \
              compute_window_ms={} compute_modes=no_yield,yield_per_unit \
@@ -1512,6 +2551,7 @@ impl SdMmc {
         );
 
         self.run_legacy_short_region_control()?;
+        self.run_range_stage_diagnostic()?;
         self.run_sustained_timing_diagnostic()?;
 
         let mut no_yield_rates = Vec::with_capacity(TEST_ROUNDS);
