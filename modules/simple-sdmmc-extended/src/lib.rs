@@ -2,6 +2,9 @@
 #![no_std]
 #![warn(missing_docs)]
 
+#[cfg(feature = "sdmmc-write-perf-test")]
+extern crate alloc;
+
 mod cmd;
 mod regs;
 mod sdmmc;

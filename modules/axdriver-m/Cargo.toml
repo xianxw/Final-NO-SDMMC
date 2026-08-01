@@ -86,6 +86,10 @@ sdmmc = [
     "dep:axhal",
     "dep:axconfig",
 ]
+sdmmc-write-perf-test = [
+    "sdmmc",
+    "axdriver_block/sdmmc-write-perf-test",
+]
 virtio = [
     "dep:axdriver_virtio",
     "dep:axalloc",

@@ -77,6 +77,12 @@ smp = [
     "axhal/smp",
     "axtask?/smp",
 ]
+sdmmc-write-perf-test = [
+    "axdriver",
+    "irq",
+    "multitask",
+    "axdriver/sdmmc-write-perf-test",
+]
 tls = [
     "axhal/tls",
     "axtask?/tls",

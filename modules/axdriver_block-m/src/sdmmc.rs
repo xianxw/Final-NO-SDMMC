@@ -28,6 +28,11 @@ impl SdMmcDriver {
         SdMmc::dma_irq_handler();
     }
 
+    #[cfg(feature = "sdmmc-write-perf-test")]
+    pub fn run_write_performance_test(&mut self) -> ! {
+        self.0.run_write_performance_test()
+    }
+
     fn map_error(error: SdMmcError) -> DevError {
         error!("SD/MMC block operation failed: {error:?}");
         match error {

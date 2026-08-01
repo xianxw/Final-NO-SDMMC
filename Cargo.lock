@@ -3110,6 +3110,7 @@ version = "0.2.0-preview.2"
 dependencies = [
  "axfeat",
  "axplat-riscv64-visionfive2",
+ "axruntime",
  "starry-kernel",
 ]
 

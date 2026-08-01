@@ -17,6 +17,10 @@ use crate::{
     utils::{Cid, CsdV2, R1CardStatus, R1CurrentState},
 };
 
+#[cfg(feature = "sdmmc-write-perf-test")]
+#[path = "sdmmc_write_performance_test.rs"]
+mod write_performance_test;
+
 // VisionFive 2 firmware configures SDIO1 CIU as PLL2 / 3 / 8 = 49.5 MHz.
 // For CLKDIV=n, DW-MMC outputs CIU / (2*n) to the card.
 const VISIONFIVE2_SDIO_CIU_CLOCK_HZ: u32 = 49_500_000;
@@ -74,6 +78,11 @@ impl IdmacCompletion {
         self.generation
             .fetch_add(1, Ordering::AcqRel)
             .wrapping_add(1)
+    }
+
+    #[cfg(feature = "sdmmc-write-perf-test")]
+    fn current_generation(&self) -> usize {
+        self.generation.load(Ordering::Acquire)
     }
 
     fn record_irq(&self, rintsts: crate::regs::RIntSts, idsts: crate::regs::IdSts) {
@@ -1102,14 +1111,41 @@ impl SdMmc {
     }
 
     fn wait_card_ready_after_write(&mut self) -> SdMmcResult {
+        #[cfg(feature = "sdmmc-write-perf-test")]
+        let busy_started_ns = axhal::time::monotonic_time_nanos();
+        #[cfg(feature = "sdmmc-write-perf-test")]
+        let mut checks = 0usize;
         let deadline = axhal::time::monotonic_time() + Duration::from_secs(5);
-        while !self.can_send_data() {
+        loop {
+            #[cfg(feature = "sdmmc-write-perf-test")]
+            {
+                checks = checks.saturating_add(1);
+            }
+            if self.can_send_data() {
+                break;
+            }
             if axhal::time::monotonic_time() >= deadline {
+                #[cfg(feature = "sdmmc-write-perf-test")]
+                write_performance_test::record_write_busy_end(
+                    false,
+                    busy_started_ns,
+                    checks,
+                    0,
+                    false,
+                );
                 self.idmac_faulted = true;
                 return Err(SdMmcError::CardBusyTimeout);
             }
             core::hint::spin_loop();
         }
+        #[cfg(feature = "sdmmc-write-perf-test")]
+        write_performance_test::record_write_busy_end(
+            false,
+            busy_started_ns,
+            checks,
+            0,
+            true,
+        );
         Ok(())
     }
 
@@ -1145,6 +1181,14 @@ impl SdMmc {
                     controller_status.data_busy(),
                     controller_status.data_state_mc_busy(),
                 );
+                #[cfg(feature = "sdmmc-write-perf-test")]
+                write_performance_test::record_write_busy_end(
+                    true,
+                    started_nanos,
+                    attempts,
+                    card_status.raw(),
+                    false,
+                );
                 guard.fault();
                 return Err(SdMmcError::CardBusyTimeout);
             }
@@ -1170,6 +1214,14 @@ impl SdMmc {
                         response,
                         controller_status.data_busy(),
                         controller_status.data_state_mc_busy(),
+                    );
+                    #[cfg(feature = "sdmmc-write-perf-test")]
+                    write_performance_test::record_write_busy_end(
+                        true,
+                        started_nanos,
+                        attempts,
+                        response,
+                        false,
                     );
                     guard.fault();
                     return Err(error);
@@ -1200,6 +1252,14 @@ impl SdMmc {
                         controller_status.data_state_mc_busy(),
                     );
                 }
+                #[cfg(feature = "sdmmc-write-perf-test")]
+                write_performance_test::record_write_busy_end(
+                    true,
+                    started_nanos,
+                    attempts,
+                    card_status.raw(),
+                    true,
+                );
                 guard.resolve();
                 return Ok(());
             }
@@ -1756,6 +1816,10 @@ impl SdMmc {
     ) -> SdMmcResult<IdmacTransferContext> {
         let cmd = context.cmd;
         context.generation = IDMAC_COMPLETION.begin_transfer();
+        #[cfg(feature = "sdmmc-write-perf-test")]
+        if write_performance_test::observation_enabled() {
+            write_performance_test::record_transfer_started(context.generation);
+        }
 
         self.regs.cmdarg().write(context.arg);
         dma_io_fence();
@@ -1961,6 +2025,12 @@ impl SdMmc {
         }
 
         let (rintsts, idsts) = self.idmac_completion_status(context.generation);
+        #[cfg(feature = "sdmmc-write-perf-test")]
+        write_performance_test::record_sync_terminal(
+            context.generation,
+            rintsts.into_bits(),
+            idsts.into_bits(),
+        );
         if Self::idmac_status_has_error(&rintsts, &idsts) {
             Err(SdMmcError::Hardware)
         } else {
@@ -1991,6 +2061,13 @@ impl SdMmc {
             })
             .await;
         let (rintsts, idsts) = self.idmac_completion_status(context.generation);
+        #[cfg(feature = "sdmmc-write-perf-test")]
+        write_performance_test::record_async_resume(
+            context.generation,
+            data_timed_out,
+            rintsts.into_bits(),
+            idsts.into_bits(),
+        );
         if data_timed_out {
             return Err(SdMmcError::DataTimeout);
         }
@@ -2099,6 +2176,10 @@ impl SdMmc {
     pub fn dma_irq_handler() {
         let regs_base = SDMMC_REGS_BASE.load(Ordering::Acquire);
         let mut should_notify = false;
+        #[cfg(feature = "sdmmc-write-perf-test")]
+        let observe_write_test = write_performance_test::observation_enabled();
+        #[cfg(feature = "sdmmc-write-perf-test")]
+        let irq_entry_ns = observe_write_test.then(axhal::time::monotonic_time_nanos);
         if regs_base != 0 {
             let regs = unsafe { VolatilePtr::new(NonNull::new_unchecked(regs_base as *mut _)) };
             let rintsts = regs.rintsts().read();
@@ -2115,6 +2196,16 @@ impl SdMmc {
             let transfer_done = idsts.ri() || idsts.ti() || rintsts.data_transfer_over();
             let transfer_event = transfer_done || rintsts.auto_command_done();
             should_notify = transfer_event || idmac_error;
+
+            #[cfg(feature = "sdmmc-write-perf-test")]
+            if should_notify && let Some(irq_entry_ns) = irq_entry_ns {
+                write_performance_test::record_irq(
+                    IDMAC_COMPLETION.current_generation(),
+                    irq_entry_ns,
+                    rintsts.into_bits(),
+                    idsts.into_bits(),
+                );
+            }
 
             if idmac_error {
                 IDMAC_ERROR_FLAG.store(true, Ordering::Release);

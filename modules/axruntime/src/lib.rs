@@ -33,6 +33,12 @@
 #![cfg_attr(not(test), no_std)]
 #![allow(missing_abi)]
 
+#[cfg(all(
+    feature = "sdmmc-write-perf-test",
+    not(all(feature = "axdriver", feature = "irq", feature = "multitask"))
+))]
+compile_error!("sdmmc-write-perf-test requires axdriver, irq, and multitask");
+
 #[macro_use]
 extern crate axlog;
 
@@ -121,6 +127,7 @@ fn is_init_ok() -> bool {
 /// In multi-core environment, this function is called on the primary core, and
 /// secondary cores call [`rust_main_secondary`].
 #[cfg_attr(not(test), axplat::main)]
+#[cfg_attr(feature = "sdmmc-write-perf-test", allow(unreachable_code))]
 pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
     #[cfg(not(feature = "plat-dyn"))]
     unsafe {
@@ -216,10 +223,26 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
     #[cfg(feature = "multitask")]
     axtask::init_scheduler();
 
+    #[cfg(all(feature = "irq", feature = "sdmmc-write-perf-test"))]
+    {
+        warn!("Initialize interrupt handlers before SDMMC write performance test...");
+        init_interrupt();
+    }
+
     #[cfg(feature = "axdriver")]
     {
         #[allow(unused_variables)]
-        let all_devices = axdriver::init_drivers();
+        #[allow(unused_mut)]
+        let mut all_devices = axdriver::init_drivers();
+
+        #[cfg(feature = "sdmmc-write-perf-test")]
+        {
+            let sdmmc = all_devices
+                .block
+                .first_mut()
+                .expect("SDMMC write performance test requires one block device");
+            sdmmc.run_write_performance_test();
+        }
 
         cfg_if::cfg_if! {
             if #[cfg(feature = "fs-ng")] {
@@ -251,7 +274,7 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
     #[cfg(feature = "smp")]
     self::mp::start_secondary_cpus(cpu_id);
 
-    #[cfg(feature = "irq")]
+    #[cfg(all(feature = "irq", not(feature = "sdmmc-write-perf-test")))]
     {
         info!("Initialize interrupt handlers...");
         init_interrupt();
